@@ -55,7 +55,7 @@ chmod +x ~/.local/bin/codex-quota-wakeup
 
 ### 2. 使用 Agent 操作指南（`guides/google-ai-perks`）
 
-直接把 [`guides/google-ai-perks/google-ai-perks-agent-guide.md`](guides/google-ai-perks/google-ai-perks-agent-guide.md) 交给你的 AI Agent（Antigravity / Claude Code / Codex），让它按指南帮你自动核查、领取并验收 Google AI 订阅福利。详情见 [`guides/google-ai-perks/README.zh-CN.md`](guides/google-ai-perks/README.zh-CN.md)。
+直接把 [`guides/google-ai-perks/google-ai-perks-agent-guide.zh-CN.md`](guides/google-ai-perks/google-ai-perks-agent-guide.zh-CN.md) 交给你的 AI Agent（Antigravity / Claude Code / Codex），让它按指南帮你自动核查、领取并验收 Google AI 订阅福利。详情见 [`guides/google-ai-perks/README.zh-CN.md`](guides/google-ai-perks/README.zh-CN.md)。
 
 ---
 
