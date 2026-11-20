@@ -1,0 +1,2824 @@
+#!/usr/bin/env python3
+"""Codex weekly quota reset detector and minimal agent wakeup tool.
+
+Checks Codex subscription rate limits via `codex app-server` stdio JSON-RPC
+(`account/read` + `account/rateLimits/read`, zero token usage, no session files
+created). Only when the weekly subscription quota window (~10080m / 7d) is
+sitting at 100% remaining (0% used) with its 7-day reset clock confirmed to be
+drifting unactivated does it send a single minimal, isolated, ephemeral,
+read-only `codex exec` request from an empty temporary directory to start the
+7-day countdown.
+
+Never hardcodes specific model versions: uses Codex's built-in default model
+with low reasoning effort (optional `--model` / `--effort` overrides available).
+
+Compatible with Python 3.8+ (macOS & Linux including Ubuntu 22.04 / WSL2).
+"""
+
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import fcntl
+import hashlib
+import json
+import math
+import os
+import platform
+import plistlib
+import pwd
+import queue
+import re
+import shlex
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+from pathlib import Path
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
+
+APP_NAME = "codex-quota-wakeup"
+LAUNCHD_LABEL = f"local.{APP_NAME}"
+SYSTEMD_UNIT_BASE = APP_NAME
+DEFAULT_INTERVAL_SECONDS = 1800  # 30m -> runs at :03 and :33 past every hour
+CALENDAR_MINUTE_OFFSET = 3
+MAX_LOG_BYTES = 2 * 1024 * 1024  # 2 MiB per log file, keep 1 rotated backup
+WEEK_SECONDS = 7 * 86400
+WEEK_MINUTES = 7 * 24 * 60  # 10080
+WEEK_MINUTES_MIN = 9500  # ~10080 * 0.95 (matches Codex TUI `is_approximate_window`)
+WEEK_MINUTES_MAX = 10600  # ~10080 * 1.05
+COUNTDOWN_GRACE_SECONDS = 900  # 15m tolerance for fast local clock skew; drift check guards inside 15m
+UNVERIFIED_COOLDOWN_SECONDS = 7200  # 2h cooldown between unverified wakeup attempts
+JUST_ACTIVATED_WINDOW_SECONDS = 960  # seamlessly bridges the 15m grace window right after activation
+MAX_PROBES_PER_WEEK = 3  # hard rolling 7-day wakeup cap per account identity
+CLOCK_BACKWARD_TOLERANCE_SECONDS = 300  # tolerate minor NTP / WSL2 resume clock rollbacks
+PROCESS_KILL_GRACE_SECONDS = 1.5
+
+TRUSTED_CHATGPT_BASE_URL = "https://chatgpt.com/backend-api/"
+TRUSTED_CHATGPT_CODEX_BASE_URL = "https://chatgpt.com/backend-api/codex"
+CONFIRMED_ACTIVE_REASONS = ("used_above_0pct", "reset_timer_counting_down")
+FORCE_OVERRIDABLE_REASONS = (
+    "used_above_0pct",
+    "reset_timer_counting_down",
+    "pinned_reset_time_just_activated",
+    "reset_window_rollover_pending",
+)
+
+# Strip environment variables that could divert Codex away from the official
+# ChatGPT subscription login/refresh endpoints or inject shell startup side effects.
+STRIP_ENV_EXACT = {
+    "OPENAI_API_KEY",
+    "CODEX_API_KEY",
+    "CODEX_ACCESS_TOKEN",
+    "OPENAI_BASE_URL",
+    "OPENAI_ORGANIZATION",
+    "OPENAI_PROJECT",
+    "OPENAI_ORG_ID",
+    "OPENAI_PROJECT_ID",
+    "OPENAI_FEDERATION_RULE_ID",
+    "OPENAI_IDENTITY_TOKEN_FILE",
+    "OPENAI_WORKLOAD_IDENTITY_CONTEXT",
+    "CODEX_OSS_BASE_URL",
+    "CODEX_OSS_PORT",
+    "CODEX_REFRESH_TOKEN_URL_OVERRIDE",
+    "CODEX_REVOKE_TOKEN_URL_OVERRIDE",
+    "CODEX_AUTHAPI_BASE_URL",
+    "CODEX_CLIENT_ID_OVERRIDE",
+    "CODEX_APP_SERVER_LOGIN_CLIENT_ID",
+    "BASH_ENV",
+    "ENV",
+    "PROMPT_COMMAND",
+    "PYTHONSTARTUP",
+}
+STRIP_ENV_PREFIXES = ("CODEX_AGENT_IDENTITY_",)
+UPSTREAM_PROXY_KEYS = ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy")
+NO_PROXY_KEYS = ("NO_PROXY", "no_proxy")
+CA_CERT_KEYS = ("CODEX_CA_CERTIFICATE", "SSL_CERT_FILE")
+PROXY_ENV_KEYS = UPSTREAM_PROXY_KEYS + NO_PROXY_KEYS + CA_CERT_KEYS
+PROXY_CONFIG_FILENAME = "proxy.json"
+
+# Codex >= 0.158.0 provides workspace-scoped `accountId` in `account/rateLimits/read`,
+# `getAuthStatus`, `config/read(includeLayers=true)`, and `codex exec --ephemeral
+# --ignore-user-config --ignore-rules`.
+MIN_CODEX_VERSION = (0, 158, 0)
+VERSION_TRIPLE_RE = re.compile(r"\b(\d+)\.(\d+)\.(\d+)\b")
+
+PROTOCOL_EVENT_TYPES = {
+    "thread.started",
+    "turn.started",
+    "turn.completed",
+    "turn.failed",
+    "item.started",
+    "item.updated",
+    "item.completed",
+    "error",
+}
+
+WAKEUP_PROMPT = "Reply with the single word OK and do not call any tools."
+
+
+class CodexTurnRuntimeError(RuntimeError):
+    """Raised when `codex exec` started running a session/turn and then failed at runtime."""
+
+
+class CodexPreSendError(RuntimeError):
+    """Raised when `codex exec` failed locally before starting any network/session turn."""
+
+
+def now_local() -> dt.datetime:
+    return dt.datetime.now().astimezone()
+
+
+def fmt_iso(ts: dt.datetime) -> str:
+    return ts.isoformat(timespec="seconds")
+
+
+def epoch_to_utc(raw: Any) -> Optional[dt.datetime]:
+    if raw is None or isinstance(raw, bool) or not isinstance(raw, (int, float)):
+        return None
+    val = float(raw)
+    if not math.isfinite(val) or val <= 0:
+        return None
+    try:
+        return dt.datetime.fromtimestamp(val, tz=dt.timezone.utc)
+    except (OverflowError, OSError, ValueError):
+        return None
+
+
+def custom_state_dir_override() -> Optional[Path]:
+    override = (os.environ.get("CODEX_QUOTA_WAKEUP_STATE_DIR") or "").strip()
+    if override:
+        return Path(os.path.abspath(os.path.expanduser(override)))
+    return None
+
+
+def custom_codex_home_override() -> Optional[Path]:
+    override = (os.environ.get("CODEX_HOME") or "").strip()
+    if override:
+        return Path(os.path.abspath(os.path.expanduser(override)))
+    return None
+
+
+def default_state_dir() -> Path:
+    override = custom_state_dir_override()
+    if override is not None:
+        return override
+    return Path.home() / ".local" / "state" / APP_NAME
+
+
+def proxy_config_path(state_dir: Path) -> Path:
+    return state_dir / PROXY_CONFIG_FILENAME
+
+
+def has_upstream_proxy(environ: Mapping[str, str]) -> bool:
+    return any((environ.get(k) or "").strip() for k in UPSTREAM_PROXY_KEYS)
+
+
+def has_ca_cert_env(environ: Mapping[str, str]) -> bool:
+    return any((environ.get(k) or "").strip() for k in CA_CERT_KEYS)
+
+
+def _normalize_ca_path(raw: str) -> str:
+    return os.path.abspath(os.path.expanduser(raw.strip()))
+
+
+def capture_proxy_env(environ: Mapping[str, str]) -> Dict[str, str]:
+    """Capture non-empty proxy & custom-CA env vars, normalizing relative CA paths."""
+    has_proxy = has_upstream_proxy(environ)
+    if not has_proxy and not has_ca_cert_env(environ):
+        return {}
+    captured: Dict[str, str] = {}
+    keys_to_scan = PROXY_ENV_KEYS if has_proxy else CA_CERT_KEYS
+    for k in keys_to_scan:
+        val = (environ.get(k) or "").strip()
+        if not val:
+            continue
+        captured[k] = _normalize_ca_path(val) if k in CA_CERT_KEYS else val
+
+    if has_proxy:
+        if not (captured.get("HTTPS_PROXY") or captured.get("https_proxy")):
+            if captured.get("ALL_PROXY"):
+                captured["HTTPS_PROXY"] = captured["ALL_PROXY"]
+            elif captured.get("all_proxy"):
+                captured["https_proxy"] = captured["all_proxy"]
+        if not (captured.get("HTTP_PROXY") or captured.get("http_proxy")):
+            if captured.get("ALL_PROXY"):
+                captured["HTTP_PROXY"] = captured["ALL_PROXY"]
+            elif captured.get("all_proxy"):
+                captured["http_proxy"] = captured["all_proxy"]
+    return captured
+
+
+def load_saved_proxy_env(state_dir: Path) -> Dict[str, str]:
+    raw = load_json_dict(proxy_config_path(state_dir)).get("env")
+    if not isinstance(raw, dict):
+        return {}
+    clean = {str(k): str(v).strip() for k, v in raw.items() if k in PROXY_ENV_KEYS and str(v).strip()}
+    return capture_proxy_env(clean)
+
+
+def redact_proxy_value(val: str) -> str:
+    if "://" in val:
+        scheme, rest = val.split("://", 1)
+        if "@" in rest:
+            return f"{scheme}://***@{rest.rsplit('@', 1)[1]}"
+        return val
+    if "@" in val:
+        return f"***@{val.rsplit('@', 1)[1]}"
+    return val
+
+
+def format_proxy_summary(proxy_env: Mapping[str, str]) -> str:
+    return ", ".join(f"{k}={redact_proxy_value(v)}" for k, v in proxy_env.items())
+
+
+def build_clean_env(state_dir: Optional[Path] = None) -> Dict[str, str]:
+    env: Dict[str, str] = {}
+    for k, v in os.environ.items():
+        if k in STRIP_ENV_EXACT or any(k.startswith(pfx) for pfx in STRIP_ENV_PREFIXES):
+            continue
+        env[k] = v
+
+    for ca_key in CA_CERT_KEYS:
+        if (env.get(ca_key) or "").strip():
+            env[ca_key] = _normalize_ca_path(env[ca_key])
+
+    saved_proxy = load_saved_proxy_env(state_dir) if state_dir is not None else {}
+    if has_upstream_proxy(env):
+        env.update(capture_proxy_env(env))
+    elif saved_proxy:
+        ambient_no_proxy = {k: env[k] for k in NO_PROXY_KEYS if (env.get(k) or "").strip()}
+        for k in UPSTREAM_PROXY_KEYS + NO_PROXY_KEYS:
+            if k in saved_proxy and not (k in NO_PROXY_KEYS and ambient_no_proxy):
+                env[k] = saved_proxy[k]
+        env.update(ambient_no_proxy)
+
+    if not has_ca_cert_env(env):
+        for ca_key in CA_CERT_KEYS:
+            if saved_proxy.get(ca_key):
+                env[ca_key] = saved_proxy[ca_key]
+
+    home = env.get("HOME") or str(Path.home())
+    env["HOME"] = home
+    codex_home = custom_codex_home_override()
+    if codex_home is not None:
+        env["CODEX_HOME"] = str(codex_home)
+
+    user_bin_dirs = [
+        str(Path(home) / ".local" / "bin"),
+        str(Path(home) / "bin"),
+    ]
+    system_fallback_dirs = [
+        "/opt/homebrew/bin",
+        "/usr/local/bin",
+        "/usr/bin",
+        "/bin",
+        "/usr/sbin",
+        "/sbin",
+    ]
+    existing = [p for p in env.get("PATH", "").split(":") if os.path.isabs(p)]
+    merged: List[str] = []
+    for p in existing + user_bin_dirs + system_fallback_dirs:
+        if p not in merged:
+            merged.append(p)
+    env["PATH"] = ":".join(merged)
+    env.setdefault("LANG", "en_US.UTF-8")
+    return env
+
+
+def _extract_workspace_restriction_ids(val: Any) -> List[str]:
+    if isinstance(val, str):
+        s = val.strip()
+        return [s] if s else []
+    if isinstance(val, list):
+        return [item.strip() for item in val if isinstance(item, str) and item.strip()]
+    return []
+
+
+def has_non_user_login_restrictions(config_layers: Any, active_account_id: str = "") -> bool:
+    """Return True if an active non-`user` layer has a `forced_*` restriction that conflicts with our login.
+
+    Because `codex exec --ignore-user-config` drops the `user` layer while keeping `system`/`mdm`/
+    `enterpriseManaged` layers, a conflicting non-user `forced_*` restriction overridden in
+    `~/.codex/config.toml` would resurface in `exec` and trigger `logout_with_message`.
+    Compliant Team/Enterprise policies (`forced_login_method="chatgpt"` or a workspace allowlist
+    containing `active_account_id`) and disabled layers (`disabledReason` set) are NOT conflicts.
+    """
+    if not isinstance(config_layers, list):
+        return False
+    for layer in config_layers:
+        if not isinstance(layer, dict):
+            continue
+        if layer.get("disabledReason"):
+            continue
+        name_obj = layer.get("name")
+        layer_type = name_obj.get("type") if isinstance(name_obj, dict) else None
+        if layer_type == "user":
+            continue
+        lcfg = layer.get("config")
+        if not isinstance(lcfg, dict):
+            continue
+        login_m = lcfg.get("forced_login_method")
+        if isinstance(login_m, str) and login_m.strip() and login_m.strip().lower() != "chatgpt":
+            return True
+        allowed_ws = _extract_workspace_restriction_ids(lcfg.get("forced_chatgpt_workspace_id"))
+        if allowed_ws and (not active_account_id or active_account_id not in allowed_ws):
+            return True
+    return False
+
+
+def build_auth_overrides_from_config(config_obj: Mapping[str, Any]) -> List[str]:
+    """Build exact TOML `-c` credential-store location overrides from `config/read`.
+
+    `forced_login_method` and `forced_chatgpt_workspace_id` are intentionally NOT forwarded
+    via `-c` to `codex exec --ignore-user-config`, because `exec`'s `enforce_login_restrictions`
+    deletes stored credentials on mismatch if the user switches accounts/workspaces mid-run.
+    """
+    overrides: List[str] = []
+
+    store = config_obj.get("cli_auth_credentials_store")
+    if isinstance(store, str) and store.strip():
+        overrides.append(f"cli_auth_credentials_store={json.dumps(store.strip())}")
+
+    features = config_obj.get("features")
+    if isinstance(features, dict):
+        sec_store = features.get("secret_auth_storage")
+        if isinstance(sec_store, bool):
+            overrides.append(f"features.secret_auth_storage={'true' if sec_store else 'false'}")
+
+    return overrides
+
+
+def ensure_bin_dir_in_path(env: Dict[str, str], bin_path: str) -> None:
+    """Prepend `bin_path`'s directory to `env['PATH']` so npm/nvm wrappers find sibling `node`."""
+    parent = str(Path(bin_path).parent)
+    if not os.path.isabs(parent):
+        return
+    parts = [p for p in env.get("PATH", "").split(":") if p]
+    if parent not in parts:
+        env["PATH"] = ":".join([parent] + parts)
+
+
+def resolve_codex_bin(explicit: Optional[str], env: Dict[str, str]) -> str:
+    if explicit is not None:
+        raw = explicit.strip()
+        if not raw:
+            raise FileNotFoundError("Explicit --codex-bin cannot be empty")
+        if ("/" in raw) or (os.sep in raw) or raw.startswith("~"):
+            candidate = os.path.abspath(os.path.expanduser(raw))
+            if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+                return candidate
+            raise FileNotFoundError(f"Explicit --codex-bin is not an executable file: {explicit!r}")
+        found_explicit = shutil.which(raw, path=env.get("PATH"))
+        if found_explicit:
+            return found_explicit
+        raise FileNotFoundError(f"Could not locate explicit --codex-bin {explicit!r} in PATH")
+    found = shutil.which("codex", path=env.get("PATH"))
+    if found:
+        return found
+    for fallback in (
+        Path(env["HOME"]) / ".local" / "bin" / "codex",
+        Path("/opt/homebrew/bin/codex"),
+        Path("/usr/local/bin/codex"),
+    ):
+        if fallback.is_file() and os.access(fallback, os.X_OK):
+            return str(fallback)
+    raise FileNotFoundError("Could not locate `codex` executable in PATH or ~/.local/bin/codex")
+
+
+def _atomic_write_bytes(path: Path, payload: bytes, mode: int = 0o644) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=str(path.parent))
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(payload)
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(tmp_name, mode)
+        os.replace(tmp_name, path)
+    except Exception:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
+
+
+def atomic_write_text(path: Path, text: str, mode: int = 0o644) -> None:
+    _atomic_write_bytes(path, text.encode("utf-8"), mode=mode)
+
+
+def atomic_write_json(path: Path, data: Any) -> None:
+    content = json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+    atomic_write_text(path, content, mode=0o600)
+
+
+def load_json_dict(path: Path) -> Dict[str, Any]:
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            obj = json.load(f)
+        return obj if isinstance(obj, dict) else {}
+    except FileNotFoundError:
+        return {}
+    except Exception:
+        return {}
+
+
+def append_jsonl_with_rotation(log_path: Path, record: Dict[str, Any], max_bytes: int = MAX_LOG_BYTES) -> None:
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    line = json.dumps(record, ensure_ascii=False) + "\n"
+    encoded = line.encode("utf-8")
+    try:
+        if log_path.exists() and log_path.stat().st_size + len(encoded) > max_bytes:
+            rotated = log_path.with_name(log_path.name + ".1")
+            os.replace(log_path, rotated)
+            try:
+                os.chmod(rotated, 0o600)
+            except OSError:
+                pass
+    except OSError:
+        pass
+    fd = os.open(str(log_path), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    try:
+        try:
+            os.fchmod(fd, 0o600)
+        except OSError:
+            pass
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(line)
+    except Exception:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        raise
+
+
+_ACTIVE_CHILD_PROC: List[Optional[subprocess.Popen]] = [None]
+
+
+def process_group_alive(pgid: int) -> bool:
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def stop_process_group(proc: Optional[subprocess.Popen], grace_seconds: float = PROCESS_KILL_GRACE_SECONDS) -> None:
+    if proc is None:
+        return
+    try:
+        pgid = os.getpgid(proc.pid)
+    except ProcessLookupError:
+        pgid = proc.pid
+
+    if proc.poll() is not None and not process_group_alive(pgid):
+        return
+
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        try:
+            os.killpg(pgid, sig)
+        except (ProcessLookupError, PermissionError):
+            return
+        deadline = time.monotonic() + grace_seconds
+        while time.monotonic() < deadline:
+            if proc.poll() is not None and not process_group_alive(pgid):
+                return
+            time.sleep(0.02)
+
+
+def _start_line_reader(stream: Any, tag: str, out_q: "queue.Queue[Tuple[str, str]]") -> threading.Thread:
+    def _reader() -> None:
+        try:
+            for line in iter(stream.readline, ""):
+                out_q.put((tag, line))
+        except Exception:
+            pass
+        finally:
+            try:
+                stream.close()
+            except Exception:
+                pass
+            out_q.put((f"eof_{tag}", ""))
+
+    t = threading.Thread(target=_reader, daemon=True)
+    t.start()
+    return t
+
+
+def _compact_cli_error(raw: str, limit: int = 460) -> str:
+    """Strip trailing `--help` usage blocks while preserving leading and trailing error context."""
+    core = re.split(r"\nUsage:\s+\S+", raw, maxsplit=1)[0].strip()
+    if len(core) <= limit:
+        return core
+    head_len = (limit // 2) + 20
+    tail_len = limit - head_len - 5
+    return f"{core[:head_len]} ... {core[-tail_len:]}"
+
+
+def ensure_min_codex_version(codex_bin: str, env: Dict[str, str]) -> None:
+    min_str = ".".join(str(x) for x in MIN_CODEX_VERSION)
+    try:
+        proc = subprocess.run(
+            [codex_bin, "--version"],
+            env=env,
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=10,
+        )
+    except Exception as exc:
+        raise RuntimeError(f"Failed to verify `codex --version` (need >= {min_str}): {exc}") from exc
+    combined = f"{proc.stdout or ''} {proc.stderr or ''}".strip()
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"`codex --version` exited with {proc.returncode} (need >= {min_str}): {combined[-200:]}"
+        )
+    m = VERSION_TRIPLE_RE.search(combined)
+    if not m:
+        raise RuntimeError(
+            f"Could not parse version from `codex --version` output {combined[:120]!r} (need >= {min_str})."
+        )
+    ver = (int(m.group(1)), int(m.group(2)), int(m.group(3)))
+    if ver < MIN_CODEX_VERSION:
+        found_str = ".".join(str(x) for x in ver)
+        raise RuntimeError(
+            f"`codex` >= {min_str} is required for isolated ephemeral quota wakeup (found {found_str}); run `codex update`."
+        )
+
+
+def build_app_server_probe_cmd(codex_bin: str) -> List[str]:
+    # Omit `--stdio`: `stdio://` is `codex app-server`'s default transport across versions.
+    # Disable hooks and plugins so periodic probes do not spawn background marketplace git syncs.
+    return [
+        codex_bin,
+        "-c",
+        'model_provider="openai"',
+        "-c",
+        f"openai_base_url={json.dumps(TRUSTED_CHATGPT_CODEX_BASE_URL)}",
+        "-c",
+        f"chatgpt_base_url={json.dumps(TRUSTED_CHATGPT_BASE_URL)}",
+        "-c",
+        "features.hooks=false",
+        "-c",
+        "features.plugins=false",
+        "app-server",
+    ]
+
+
+def validate_effective_endpoints(config_obj: Mapping[str, Any]) -> None:
+    """Ensure managed `requirements.toml` did not redirect auth/quota/model traffic off first-party endpoints."""
+    provider = config_obj.get("model_provider")
+    if provider is not None and str(provider).strip() not in ("", "openai"):
+        raise RuntimeError(
+            f"Managed Codex configuration overrides `model_provider` to {provider!r}; refusing to send subscription credentials."
+        )
+
+    cgpt_url = config_obj.get("chatgpt_base_url")
+    if cgpt_url is not None and str(cgpt_url).strip():
+        if str(cgpt_url).strip().rstrip("/") != TRUSTED_CHATGPT_BASE_URL.rstrip("/"):
+            raise RuntimeError(
+                "Managed Codex configuration overrides `chatgpt_base_url` away from official `https://chatgpt.com/backend-api/`; skipping quota check."
+            )
+
+    oai_url = config_obj.get("openai_base_url")
+    if oai_url is not None and str(oai_url).strip():
+        if str(oai_url).strip().rstrip("/") != TRUSTED_CHATGPT_CODEX_BASE_URL.rstrip("/"):
+            raise RuntimeError(
+                "Managed Codex configuration overrides `openai_base_url` away from official ChatGPT Codex backend; skipping quota check."
+            )
+
+    providers_map = config_obj.get("model_providers")
+    if isinstance(providers_map, dict) and isinstance(providers_map.get("openai"), dict):
+        custom_oai_base = providers_map["openai"].get("base_url")
+        if custom_oai_base is not None and str(custom_oai_base).strip():
+            if str(custom_oai_base).strip().rstrip("/") != TRUSTED_CHATGPT_CODEX_BASE_URL.rstrip("/"):
+                raise RuntimeError(
+                    "Codex `[model_providers.openai]` overrides `base_url` away from official ChatGPT Codex backend; skipping quota check."
+                )
+
+
+def fetch_quota_snapshot(
+    codex_bin: str,
+    env: Dict[str, str],
+    timeout_s: float = 45.0,
+) -> Dict[str, Any]:
+    """Read effective config, subscription account, auth method, and rate limits via stdio JSON-RPC."""
+    cmd = build_app_server_probe_cmd(codex_bin)
+    out_q: "queue.Queue[Tuple[str, str]]" = queue.Queue()
+    stderr_lines: List[str] = []
+    proc: Optional[subprocess.Popen] = None
+    t_out: Optional[threading.Thread] = None
+    t_err: Optional[threading.Thread] = None
+    deadline = time.monotonic() + timeout_s
+
+    def _send(payload: Dict[str, Any]) -> None:
+        if proc is None or proc.stdin is None:
+            raise RuntimeError("codex app-server stdin is closed")
+        try:
+            proc.stdin.write(json.dumps(payload, ensure_ascii=False) + "\n")
+            proc.stdin.flush()
+        except OSError as exc:
+            detail = _compact_cli_error("\n".join(stderr_lines[-8:]) or str(exc))
+            raise RuntimeError(f"Failed to write to codex app-server: {detail}") from exc
+
+    with tempfile.TemporaryDirectory(prefix=f"{APP_NAME}-rpc-") as tmpdir:
+        try:
+            proc = subprocess.Popen(
+                cmd,
+                cwd=tmpdir,
+                env=env,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                bufsize=1,
+                start_new_session=True,
+            )
+            _ACTIVE_CHILD_PROC[0] = proc
+            t_out = _start_line_reader(proc.stdout, "stdout", out_q)
+            t_err = _start_line_reader(proc.stderr, "stderr", out_q)
+
+            _send(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "initialize",
+                    "params": {
+                        "clientInfo": {"name": APP_NAME, "version": "1.0"},
+                        "capabilities": {"experimentalApi": False},
+                    },
+                }
+            )
+
+            account_res: Optional[Dict[str, Any]] = None
+            auth_status_res: Optional[Dict[str, Any]] = None
+            ratelimits_res: Optional[Dict[str, Any]] = None
+            config_obj: Optional[Dict[str, Any]] = None
+            config_layers: Optional[List[Dict[str, Any]]] = None
+            config_done = False
+            retried_rl_without_params = False
+            next_rpc_id = 10
+            pending_kind: Dict[int, str] = {1: "init"}
+            stdout_eof = False
+
+            while not (
+                account_res is not None
+                and auth_status_res is not None
+                and ratelimits_res is not None
+                and config_done
+            ):
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError(f"`codex app-server` timed out after {timeout_s:.0f}s")
+                try:
+                    kind, raw_line = out_q.get(timeout=min(0.25, remaining))
+                except queue.Empty:
+                    if stdout_eof and proc.poll() is not None:
+                        break
+                    continue
+
+                if kind == "stderr":
+                    stderr_lines.append(raw_line.rstrip("\r\n"))
+                    continue
+                if kind == "eof_stderr":
+                    continue
+                if kind == "eof_stdout":
+                    stdout_eof = True
+                    if proc.poll() is not None and out_q.empty():
+                        break
+                    continue
+                if kind != "stdout":
+                    continue
+
+                s = raw_line.strip()
+                if not s:
+                    continue
+                try:
+                    msg = json.loads(s)
+                except ValueError:
+                    continue
+                if not isinstance(msg, dict):
+                    continue
+
+                # Reject unexpected server-initiated requests cleanly so the server never blocks.
+                if "id" in msg and "method" in msg:
+                    _send(
+                        {
+                            "jsonrpc": "2.0",
+                            "id": msg["id"],
+                            "error": {"code": -32601, "message": "Unsupported server request"},
+                        }
+                    )
+                    continue
+
+                if "id" not in msg or "method" in msg:
+                    continue
+
+                rid = msg.get("id")
+                pkind = pending_kind.pop(rid, None)
+                if pkind is None:
+                    continue
+
+                err = msg.get("error")
+                res = msg.get("result")
+
+                if pkind == "init":
+                    if err:
+                        raise RuntimeError(f"codex app-server initialize failed: {err}")
+                    _send({"jsonrpc": "2.0", "method": "initialized", "params": {}})
+                    pending_kind[4] = "config"
+                    _send(
+                        {
+                            "jsonrpc": "2.0",
+                            "id": 4,
+                            "method": "config/read",
+                            "params": {"includeLayers": True},
+                        }
+                    )
+                    continue
+
+                if pkind == "config":
+                    if err:
+                        raise RuntimeError(
+                            f"config/read failed: {err.get('message') if isinstance(err, dict) else err}"
+                        )
+                    cfg_inner = res.get("config") if isinstance(res, dict) else None
+                    if not isinstance(cfg_inner, dict):
+                        raise RuntimeError("config/read returned invalid `config` object")
+                    validate_effective_endpoints(cfg_inner)
+                    raw_layers = res.get("layers") if isinstance(res, dict) else None
+                    config_obj = cfg_inner
+                    config_layers = [item for item in raw_layers if isinstance(item, dict)] if isinstance(raw_layers, list) else None
+                    config_done = True
+
+                    pending_kind[2] = "account"
+                    _send({"jsonrpc": "2.0", "id": 2, "method": "account/read", "params": {"refreshToken": False}})
+                    pending_kind[6] = "auth_status"
+                    _send(
+                        {
+                            "jsonrpc": "2.0",
+                            "id": 6,
+                            "method": "getAuthStatus",
+                            "params": {"includeToken": False, "refreshToken": False},
+                        }
+                    )
+                    pending_kind[3] = "ratelimits"
+                    _send(
+                        {
+                            "jsonrpc": "2.0",
+                            "id": 3,
+                            "method": "account/rateLimits/read",
+                            "params": {"excludeResetCreditDetails": True},
+                        }
+                    )
+                    continue
+
+                if pkind == "account":
+                    if err:
+                        raise RuntimeError(f"account/read failed: {err.get('message') if isinstance(err, dict) else err}")
+                    if not isinstance(res, dict):
+                        raise RuntimeError("account/read returned invalid result payload")
+                    account_res = res
+                    continue
+
+                if pkind == "auth_status":
+                    if err:
+                        raise RuntimeError(
+                            f"getAuthStatus failed: {err.get('message') if isinstance(err, dict) else err}"
+                        )
+                    if not isinstance(res, dict):
+                        raise RuntimeError("getAuthStatus returned invalid result payload")
+                    auth_status_res = res
+                    continue
+
+                if pkind == "ratelimits":
+                    if err:
+                        code = err.get("code") if isinstance(err, dict) else None
+                        if code in (-32600, -32602) and not retried_rl_without_params:
+                            retried_rl_without_params = True
+                            rpc_id = next_rpc_id
+                            next_rpc_id += 1
+                            pending_kind[rpc_id] = "ratelimits"
+                            _send({"jsonrpc": "2.0", "id": rpc_id, "method": "account/rateLimits/read", "params": None})
+                            continue
+                        raise RuntimeError(
+                            f"account/rateLimits/read failed: {err.get('message') if isinstance(err, dict) else err}"
+                        )
+                    if not isinstance(res, dict):
+                        raise RuntimeError("account/rateLimits/read returned invalid result payload")
+                    ratelimits_res = res
+                    continue
+
+            if account_res is None or auth_status_res is None or ratelimits_res is None or not config_done:
+                detail = _compact_cli_error("\n".join(stderr_lines[-8:]) or f"exit code {proc.poll()}")
+                raise RuntimeError(f"codex app-server exited before returning quota data: {detail}")
+
+            validate_subscription_account(account_res, auth_status_res)
+            return {
+                "account": account_res,
+                "auth_status": auth_status_res,
+                "rate_limits": ratelimits_res,
+                "config": config_obj,
+                "config_layers": config_layers,
+            }
+        finally:
+            if _ACTIVE_CHILD_PROC[0] is proc:
+                _ACTIVE_CHILD_PROC[0] = None
+            if proc is not None:
+                try:
+                    if proc.stdin is not None:
+                        proc.stdin.close()
+                except OSError:
+                    pass
+                stop_process_group(proc)
+                if t_out is not None:
+                    t_out.join(timeout=0.2)
+                if t_err is not None:
+                    t_err.join(timeout=0.2)
+
+
+def validate_subscription_account(
+    account_res: Dict[str, Any], auth_status_res: Optional[Mapping[str, Any]] = None
+) -> None:
+    acct = account_res.get("account")
+    if acct is None:
+        raise RuntimeError(
+            "No Codex account is signed in; run `codex login` with your ChatGPT subscription account."
+        )
+    if not isinstance(acct, dict):
+        raise RuntimeError("Unexpected `account` field in `account/read` response.")
+    acct_type = str(acct.get("type") or "")
+    if acct_type != "chatgpt":
+        raise RuntimeError(
+            f"Active Codex auth type is {acct_type!r} (not a ChatGPT subscription); weekly quota wakeup only applies to ChatGPT subscriptions."
+        )
+    if isinstance(auth_status_res, Mapping) and "authMethod" in auth_status_res:
+        auth_method = str(auth_status_res.get("authMethod") or "")
+        if auth_method != "chatgpt":
+            raise RuntimeError(
+                f"Active Codex auth method is {auth_method!r} (expected interactive 'chatgpt' subscription login)."
+            )
+
+
+def extract_workspace_account_id(snap_bundle: Mapping[str, Any]) -> str:
+    """Extract workspace-scoped `accountId` from rateLimits or account workspaceRouting."""
+    rl = snap_bundle.get("rate_limits")
+    if isinstance(rl, dict):
+        raw_aid = rl.get("accountId")
+        if isinstance(raw_aid, str) and raw_aid.strip():
+            return raw_aid.strip()
+    acct_resp = snap_bundle.get("account")
+    if isinstance(acct_resp, dict):
+        ws_routing = acct_resp.get("workspaceRouting")
+        if isinstance(ws_routing, dict):
+            raw_ws = ws_routing.get("chatgptAccountId")
+            if isinstance(raw_ws, str) and raw_ws.strip():
+                return raw_ws.strip()
+    return ""
+
+
+def extract_account_identity_key(snap_bundle: Mapping[str, Any]) -> Optional[str]:
+    """Derive a privacy-safe workspace+user identity key; returns None if workspace ID is absent."""
+    aid = extract_workspace_account_id(snap_bundle)
+    if not aid:
+        return None
+    email = ""
+    acct_resp = snap_bundle.get("account")
+    if isinstance(acct_resp, dict):
+        acct_obj = acct_resp.get("account")
+        if isinstance(acct_obj, dict):
+            raw_email = acct_obj.get("email")
+            if isinstance(raw_email, str) and raw_email.strip():
+                email = raw_email.strip().lower()
+    digest = hashlib.sha256(f"{aid}\0{email}".encode("utf-8")).hexdigest()[:24]
+    return f"id:{digest}"
+
+
+def fetch_quota_with_retries(
+    codex_bin: str,
+    env: Dict[str, str],
+    retry_delays: Sequence[float],
+    attempts_sink: Optional[List[int]] = None,
+) -> Tuple[Dict[str, Any], int]:
+    attempts = 0
+    last_err: Optional[Exception] = None
+    for idx in range(len(retry_delays) + 1):
+        attempts += 1
+        if attempts_sink is not None:
+            attempts_sink[:] = [attempts]
+        try:
+            snap = fetch_quota_snapshot(codex_bin, env=env)
+            return snap, attempts
+        except Exception as exc:
+            last_err = exc
+            if idx < len(retry_delays) and retry_delays[idx] > 0:
+                time.sleep(retry_delays[idx])
+    assert last_err is not None
+    raise last_err
+
+
+def is_weekly_window_duration(window_mins: Any) -> bool:
+    if window_mins is None or isinstance(window_mins, bool) or not isinstance(window_mins, (int, float)):
+        return False
+    return WEEK_MINUTES_MIN <= float(window_mins) <= WEEK_MINUTES_MAX
+
+
+def select_codex_bucket_snapshot(rate_limits_payload: Dict[str, Any]) -> Dict[str, Any]:
+    by_id = rate_limits_payload.get("rateLimitsByLimitId")
+    if isinstance(by_id, dict):
+        if isinstance(by_id.get("codex"), dict):
+            return by_id["codex"]
+        for k, v in by_id.items():
+            if str(k).lower() == "codex" and isinstance(v, dict):
+                return v
+    top = rate_limits_payload.get("rateLimits")
+    if isinstance(top, dict):
+        return top
+    raise ValueError("Missing `rateLimits` snapshot in `account/rateLimits/read` output")
+
+
+def extract_weekly_window(rate_limits_payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Locate the subscription weekly window (~10080m) across single- or dual-window plans."""
+    snap = select_codex_bucket_snapshot(rate_limits_payload)
+    primary = snap.get("primary") if isinstance(snap.get("primary"), dict) else None
+    secondary = snap.get("secondary") if isinstance(snap.get("secondary"), dict) else None
+
+    chosen_slot: Optional[str] = None
+    chosen_win: Optional[Dict[str, Any]] = None
+
+    if primary is not None and is_weekly_window_duration(primary.get("windowDurationMins")):
+        chosen_slot, chosen_win = "primary", primary
+    elif secondary is not None and is_weekly_window_duration(secondary.get("windowDurationMins")):
+        chosen_slot, chosen_win = "secondary", secondary
+    elif (
+        secondary is not None
+        and secondary.get("windowDurationMins") is None
+        and (primary is None or primary.get("windowDurationMins") is None)
+    ):
+        chosen_slot, chosen_win = "secondary", secondary
+
+    if chosen_win is None or chosen_slot is None:
+        plan = snap.get("planType") or "unknown"
+        p_mins = primary.get("windowDurationMins") if primary else None
+        s_mins = secondary.get("windowDurationMins") if secondary else None
+        raise ValueError(
+            f"No weekly quota window (~{WEEK_MINUTES}m) found in Codex rate limits "
+            f"(planType={plan!r}, primary={p_mins}, secondary={s_mins})"
+        )
+
+    return {
+        "pool": "codex",
+        "limit_id": str(snap.get("limitId") or "codex"),
+        "plan_type": snap.get("planType"),
+        "slot": chosen_slot,
+        "snapshot": snap,
+        "window": chosen_win,
+        "ordinary_usage_allowed": rate_limits_payload.get("ordinaryUsageAllowed"),
+    }
+
+
+def _sibling_window_exhausted(snap: Dict[str, Any], weekly_slot: str, now_utc: dt.datetime) -> bool:
+    other_key = "secondary" if weekly_slot == "primary" else "primary"
+    other = snap.get(other_key)
+    if not isinstance(other, dict):
+        return False
+    other_used = other.get("usedPercent")
+    if other_used is None or isinstance(other_used, bool) or not isinstance(other_used, (int, float)):
+        return False
+    if float(other_used) < 100.0:
+        return False
+    other_reset_utc = epoch_to_utc(other.get("resetsAt"))
+    if other_reset_utc is not None and other_reset_utc <= now_utc:
+        return False
+    return True
+
+
+def _recent_probe_epochs(last_pool_state: Optional[Dict[str, Any]], now_epoch: float) -> List[float]:
+    if not isinstance(last_pool_state, dict):
+        return []
+    raw_list = last_pool_state.get("probe_epochs")
+    kept: List[float] = []
+    if isinstance(raw_list, list):
+        for item in raw_list:
+            if isinstance(item, (int, float)) and not isinstance(item, bool) and math.isfinite(float(item)):
+                val = float(item)
+                if -CLOCK_BACKWARD_TOLERANCE_SECONDS <= (now_epoch - val) < WEEK_SECONDS:
+                    kept.append(val)
+    return kept[-10:]
+
+
+def _check_probe_budget_block(
+    last_pool_state: Optional[Dict[str, Any]], now_epoch: float, has_explicit_model: bool
+) -> Optional[str]:
+    if not isinstance(last_pool_state, dict):
+        return None
+    recent_probes = _recent_probe_epochs(last_pool_state, now_epoch)
+    max_weekly_probes = 2 if has_explicit_model else MAX_PROBES_PER_WEEK
+    if len(recent_probes) >= max_weekly_probes:
+        return "weekly_wakeup_cap_reached"
+
+    streak = _effective_unverified_streak(last_pool_state, now_epoch)
+    max_unverified = 1 if has_explicit_model else 2
+    if streak >= max_unverified:
+        return "unverified_wakeup_cap_reached"
+
+    last_epoch = last_pool_state.get("last_probe_epoch")
+    verified = last_pool_state.get("verified_active")
+    if (
+        (verified is False or streak > 0)
+        and isinstance(last_epoch, (int, float))
+        and not isinstance(last_epoch, bool)
+        and -CLOCK_BACKWARD_TOLERANCE_SECONDS <= (now_epoch - float(last_epoch)) < UNVERIFIED_COOLDOWN_SECONDS
+    ):
+        return "unverified_probe_cooldown"
+    return None
+
+
+def _effective_unverified_streak(last_pool_state: Optional[Dict[str, Any]], now_epoch: float) -> int:
+    if not isinstance(last_pool_state, dict):
+        return 0
+    raw = last_pool_state.get("unverified_streak")
+    has_positive_streak = isinstance(raw, int) and not isinstance(raw, bool) and raw > 0
+    if last_pool_state.get("verified_active") is not False and not has_positive_streak:
+        return 0
+    last_epoch = last_pool_state.get("last_probe_epoch")
+    if not isinstance(last_epoch, (int, float)) or isinstance(last_epoch, bool):
+        return 0
+    if not (-CLOCK_BACKWARD_TOLERANCE_SECONDS <= (now_epoch - float(last_epoch)) < WEEK_SECONDS):
+        return 0
+    if has_positive_streak:
+        return int(raw)
+    return 1
+
+
+def evaluate_weekly_activity(
+    weekly_item: Dict[str, Any],
+    now_utc: dt.datetime,
+    last_pool_state: Optional[Dict[str, Any]] = None,
+    has_explicit_model: bool = False,
+) -> Tuple[bool, str, Dict[str, Any]]:
+    """Return (is_active_or_skip, reason, summary_fields).
+
+    `True` means no wakeup request should be sent right now (either the 7-day
+    clock is already active, quota is exhausted/blocked, or a safety cooldown/cap
+    applies). `False` means the weekly window is sitting at 100% unactivated.
+    """
+    snap = weekly_item["snapshot"]
+    win = weekly_item["window"]
+    slot = str(weekly_item.get("slot") or "primary")
+    ordinary_allowed = weekly_item.get("ordinary_usage_allowed")
+
+    used_raw = win.get("usedPercent")
+    if used_raw is None or isinstance(used_raw, bool) or not isinstance(used_raw, (int, float)):
+        raise ValueError("Weekly rate-limit window missing numeric `usedPercent`")
+    used_pct = float(used_raw)
+    if not math.isfinite(used_pct):
+        raise ValueError(f"Invalid `usedPercent` in weekly window: {used_raw!r}")
+    remaining_pct = round(max(0.0, min(100.0, 100.0 - used_pct)), 4)
+
+    win_mins = win.get("windowDurationMins")
+    window_seconds = float(win_mins) * 60.0 if is_weekly_window_duration(win_mins) else float(WEEK_SECONDS)
+
+    resets_raw = win.get("resetsAt")
+    reset_utc = epoch_to_utc(resets_raw)
+    resets_at_epoch = int(round(float(resets_raw))) if reset_utc is not None else None
+    seconds_until_reset: Optional[float] = None
+    if reset_utc is not None:
+        seconds_until_reset = (reset_utc - now_utc).total_seconds()
+
+    local_reset_str = fmt_iso(reset_utc.astimezone()) if reset_utc is not None else ""
+    meta: Dict[str, Any] = {
+        "plan_type": weekly_item.get("plan_type"),
+        "window_slot": slot,
+        "window_duration_mins": win_mins,
+        "used_pct": round(used_pct, 4),
+        "remaining_pct": remaining_pct,
+        "resets_at": resets_at_epoch,
+        "reset_time": local_reset_str,
+        "seconds_until_reset": round(seconds_until_reset, 1) if seconds_until_reset is not None else None,
+    }
+
+    if (
+        ordinary_allowed is False
+        or snap.get("spendControlReached") is True
+        or snap.get("rateLimitReachedType") is not None
+        or used_pct >= 100.0
+        or _sibling_window_exhausted(snap, slot, now_utc)
+    ):
+        return True, "quota_exhausted_or_blocked", meta
+
+    if used_pct > 0.0:
+        return True, "used_above_0pct", meta
+
+    if reset_utc is None or resets_at_epoch is None:
+        return True, "missing_reset_time", meta
+
+    if seconds_until_reset is not None and seconds_until_reset <= 0:
+        return True, "reset_window_rollover_pending", meta
+
+    if seconds_until_reset is not None and seconds_until_reset < (window_seconds - COUNTDOWN_GRACE_SECONDS):
+        return True, "reset_timer_counting_down", meta
+
+    if isinstance(last_pool_state, dict):
+        now_epoch = now_utc.timestamp()
+        last_epoch = last_pool_state.get("last_probe_epoch")
+        locked_epoch = last_pool_state.get("locked_resets_at")
+        verified = last_pool_state.get("verified_active")
+
+        if (
+            verified is True
+            and isinstance(last_epoch, (int, float))
+            and not isinstance(last_epoch, bool)
+            and -CLOCK_BACKWARD_TOLERANCE_SECONDS <= (now_epoch - float(last_epoch)) < JUST_ACTIVATED_WINDOW_SECONDS
+            and isinstance(locked_epoch, (int, float))
+            and not isinstance(locked_epoch, bool)
+            and abs(resets_at_epoch - int(locked_epoch)) <= 30
+        ):
+            return True, "pinned_reset_time_just_activated", meta
+
+        budget_block = _check_probe_budget_block(last_pool_state, now_epoch, has_explicit_model)
+        if budget_block is not None:
+            return True, budget_block, meta
+
+    return False, "unactivated_100pct", meta
+
+
+def build_wakeup_command(
+    codex_bin: str,
+    model_id: Optional[str],
+    effort: Optional[str],
+    auth_overrides: Sequence[str] = (),
+) -> List[str]:
+    """Isolated, ephemeral, read-only `codex exec` command without yolo or Fast mode."""
+    cmd = [
+        codex_bin,
+        "exec",
+        "--ephemeral",
+        "--ignore-user-config",
+        "--ignore-rules",
+        "--skip-git-repo-check",
+        "--sandbox",
+        "read-only",
+        "--color",
+        "never",
+        "--json",
+        "-c",
+        'model_provider="openai"',
+        "-c",
+        f"openai_base_url={json.dumps(TRUSTED_CHATGPT_CODEX_BASE_URL)}",
+        "-c",
+        f"chatgpt_base_url={json.dumps(TRUSTED_CHATGPT_BASE_URL)}",
+        "-c",
+        'approval_policy="never"',
+        "-c",
+        'service_tier="default"',
+        "-c",
+        "features.fast_mode=false",
+        "-c",
+        "features.hooks=false",
+        "-c",
+        "features.plugins=false",
+    ]
+    for ov in auth_overrides:
+        cmd += ["-c", ov]
+    if model_id:
+        cmd += ["--model", model_id]
+    if effort:
+        cmd += ["-c", f"model_reasoning_effort={json.dumps(effort)}"]
+    cmd.append(WAKEUP_PROMPT)
+    return cmd
+
+
+def run_codex_exec(
+    cmd: Sequence[str],
+    env: Dict[str, str],
+    timeout_s: float = 90.0,
+) -> Dict[str, Any]:
+    """Run `codex exec --json` in an isolated empty directory and kill the process group on timeout."""
+    t0 = time.monotonic()
+    out_q: "queue.Queue[Tuple[str, str]]" = queue.Queue()
+    stdout_lines: List[str] = []
+    stderr_lines: List[str] = []
+    proc: Optional[subprocess.Popen] = None
+    t_out: Optional[threading.Thread] = None
+    t_err: Optional[threading.Thread] = None
+    timed_out = False
+    deadline = t0 + timeout_s
+
+    with tempfile.TemporaryDirectory(prefix=f"{APP_NAME}-exec-") as tmpdir:
+        try:
+            try:
+                proc = subprocess.Popen(
+                    list(cmd),
+                    cwd=tmpdir,
+                    env=env,
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    bufsize=1,
+                    start_new_session=True,
+                )
+                _ACTIVE_CHILD_PROC[0] = proc
+            except OSError as exc:
+                raise CodexPreSendError(f"Failed to launch codex exec: {exc}") from exc
+
+            t_out = _start_line_reader(proc.stdout, "stdout", out_q)
+            t_err = _start_line_reader(proc.stderr, "stderr", out_q)
+
+            eof_out = False
+            eof_err = False
+            while not (eof_out and eof_err and proc.poll() is not None):
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    timed_out = True
+                    stop_process_group(proc)
+                    raise subprocess.TimeoutExpired(cmd=list(cmd), timeout=timeout_s)
+                try:
+                    kind, line = out_q.get(timeout=min(0.25, remaining))
+                except queue.Empty:
+                    if eof_out and eof_err and proc.poll() is not None:
+                        break
+                    continue
+                if kind == "stdout":
+                    stdout_lines.append(line)
+                elif kind == "stderr":
+                    stderr_lines.append(line)
+                elif kind == "eof_stdout":
+                    eof_out = True
+                elif kind == "eof_stderr":
+                    eof_err = True
+
+            rc = proc.wait(timeout=2.0)
+        finally:
+            if _ACTIVE_CHILD_PROC[0] is proc:
+                _ACTIVE_CHILD_PROC[0] = None
+            if not timed_out:
+                stop_process_group(proc)
+            if t_out is not None:
+                t_out.join(timeout=0.2)
+            if t_err is not None:
+                t_err.join(timeout=0.2)
+
+    duration_s = round(time.monotonic() - t0, 3)
+    stdout = "".join(stdout_lines).strip()
+    stderr = "".join(stderr_lines).strip()
+
+    thread_id: Optional[str] = None
+    agent_messages: List[str] = []
+    usage: Dict[str, Any] = {}
+    turn_completed = False
+    saw_protocol_event = False
+    stream_errors: List[str] = []
+
+    for raw_line in stdout.splitlines():
+        s = raw_line.strip()
+        if not s:
+            continue
+        try:
+            ev = json.loads(s)
+        except ValueError:
+            continue
+        if not isinstance(ev, dict):
+            continue
+        ev_type = ev.get("type")
+        if ev_type in PROTOCOL_EVENT_TYPES:
+            saw_protocol_event = True
+        if ev_type == "thread.started":
+            tid = ev.get("thread_id")
+            if isinstance(tid, str) and tid:
+                thread_id = tid
+        elif ev_type == "item.completed":
+            item = ev.get("item")
+            if isinstance(item, dict) and item.get("type") == "agent_message":
+                txt = str(item.get("text") or "").strip()
+                if txt:
+                    agent_messages.append(txt)
+        elif ev_type == "turn.completed":
+            turn_completed = True
+            if isinstance(ev.get("usage"), dict):
+                usage = ev["usage"]
+        elif ev_type == "turn.failed":
+            err_obj = ev.get("error")
+            if isinstance(err_obj, dict) and err_obj.get("message"):
+                stream_errors.append(str(err_obj["message"]))
+            else:
+                stream_errors.append(str(err_obj or "turn.failed"))
+        elif ev_type == "error":
+            if ev.get("message"):
+                stream_errors.append(str(ev["message"]))
+
+    if rc != 0 or not turn_completed:
+        err_text = "; ".join(stream_errors) if stream_errors else (stderr or stdout or f"exit code {rc}")
+        detail = _compact_cli_error(err_text)
+        if not saw_protocol_event and rc == 2:
+            raise CodexPreSendError(f"codex exec rejected CLI arguments ({rc}): {detail}")
+        err_cls = CodexTurnRuntimeError if saw_protocol_event else RuntimeError
+        raise err_cls(f"codex exec failed ({rc}): {detail}")
+
+    total_tokens: Optional[int] = None
+    if usage:
+        in_tok = int(usage.get("input_tokens") or 0)
+        out_tok = int(usage.get("output_tokens") or 0)
+        total_tokens = in_tok + out_tok
+
+    return {
+        "thread_id": thread_id,
+        "response": (agent_messages[-1] if agent_messages else "").strip()[:80],
+        "duration_seconds": duration_s,
+        "usage": usage,
+        "total_tokens": total_tokens,
+    }
+
+
+def send_wakeup_request(
+    codex_bin: str,
+    model_id: Optional[str],
+    effort: Optional[str],
+    env: Dict[str, str],
+    auth_overrides: Sequence[str] = (),
+    runner: Any = run_codex_exec,
+) -> Tuple[Dict[str, Any], str]:
+    """Send isolated ephemeral read-only agent wakeup request."""
+    cmd = build_wakeup_command(
+        codex_bin,
+        model_id=model_id,
+        effort=effort,
+        auth_overrides=auth_overrides,
+    )
+    res = runner(cmd, env=env, timeout_s=90.0)
+    return res, "ephemeral_exec"
+
+
+def parse_retry_delays_arg(raw: str) -> List[float]:
+    if not raw or not raw.strip():
+        return []
+    delays: List[float] = []
+    for part in raw.split(","):
+        s = part.strip()
+        if not s:
+            continue
+        try:
+            val = float(s)
+        except ValueError as exc:
+            raise argparse.ArgumentTypeError(f"invalid delay {s!r} in --retry-delays (expected seconds)") from exc
+        if not math.isfinite(val) or val < 0:
+            raise argparse.ArgumentTypeError(f"delay must be a non-negative finite number, got {s!r}")
+        delays.append(val)
+    return delays
+
+
+def execute_run(args: argparse.Namespace) -> int:
+    start_mono = time.monotonic()
+    started_at = now_local()
+    state_dir = default_state_dir()
+    state_dir.mkdir(parents=True, exist_ok=True)
+    lock_path = state_dir / "wakeup.lock"
+    state_path = state_dir / "state.json"
+    log_path = state_dir / "wakeup.jsonl"
+
+    lock_fh = lock_path.open("a+", encoding="utf-8")
+    prev_sigterm = None
+    prev_sigint = None
+    if threading.current_thread() is threading.main_thread():
+        def _handle_term(signum: int, _frame: Any) -> None:
+            stop_process_group(_ACTIVE_CHILD_PROC[0])
+            raise SystemExit(128 + signum)
+
+        prev_sigterm = signal.signal(signal.SIGTERM, _handle_term)
+        prev_sigint = signal.signal(signal.SIGINT, _handle_term)
+    try:
+        try:
+            fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            rec = {
+                "ts": fmt_iso(started_at),
+                "status": "skipped_locked",
+                "duration_ms": int((time.monotonic() - start_mono) * 1000),
+                "error": f"Another {APP_NAME} instance is currently holding wakeup.lock",
+            }
+            if not args.quiet:
+                print(json.dumps(rec, ensure_ascii=False))
+            return 0
+
+        retry_delays = (
+            list(args.retry_delays)
+            if isinstance(args.retry_delays, list)
+            else parse_retry_delays_arg(str(args.retry_delays or ""))
+        )
+        env = build_clean_env(state_dir=state_dir)
+        state = load_json_dict(state_path)
+        if not isinstance(state.get("pools"), dict):
+            state["pools"] = {}
+        if not isinstance(state.get("accounts"), dict):
+            state["accounts"] = {}
+        pool_states: Dict[str, Any] = state["pools"]
+        account_states: Dict[str, Any] = state["accounts"]
+
+        def _persist_account_state(acct_k: Optional[str], entry_state: Optional[Dict[str, Any]]) -> None:
+            if entry_state is None:
+                if acct_k:
+                    account_states.pop(acct_k, None)
+                if not acct_k or (isinstance(pool_states.get("codex"), dict) and pool_states["codex"].get("account_key") == acct_k):
+                    pool_states.pop("codex", None)
+            else:
+                pool_states["codex"] = entry_state
+                if acct_k:
+                    account_states[acct_k] = entry_state
+                    while len(account_states) > 16:
+                        oldest_k = min(
+                            account_states.keys(),
+                            key=lambda k: float((account_states.get(k) or {}).get("last_probe_epoch") or 0.0),
+                        )
+                        if oldest_k == acct_k and len(account_states) > 1:
+                            other_keys = [k for k in account_states.keys() if k != acct_k]
+                            oldest_k = other_keys[0]
+                        account_states.pop(oldest_k, None)
+            atomic_write_json(state_path, state)
+
+        has_explicit_model = bool(args.model and args.model.strip())
+        attempts_box: List[int] = [0]
+        pools_report: Dict[str, Any] = {}
+        try:
+            codex_bin = resolve_codex_bin(args.codex_bin, env)
+            ensure_bin_dir_in_path(env, codex_bin)
+            ensure_min_codex_version(codex_bin, env)
+            snap_bundle, attempts = fetch_quota_with_retries(
+                codex_bin,
+                env=env,
+                retry_delays=retry_delays,
+                attempts_sink=attempts_box,
+            )
+            weekly_item = extract_weekly_window(snap_bundle["rate_limits"])
+        except Exception as exc:
+            rec = {
+                "ts": fmt_iso(started_at),
+                "status": "error",
+                "stage": "check_quota",
+                "attempts": attempts_box[0],
+                "duration_ms": int((time.monotonic() - start_mono) * 1000),
+                "error": _compact_cli_error(str(exc), limit=320),
+            }
+            if not args.dry_run:
+                append_jsonl_with_rotation(log_path, rec)
+            if not args.quiet:
+                print(json.dumps(rec, ensure_ascii=False), file=sys.stderr)
+            return 1
+
+        check_utc = dt.datetime.now(dt.timezone.utc)
+        pool = "codex"
+        account_key = extract_account_identity_key(snap_bundle)
+        if account_key:
+            raw_prev = account_states.get(account_key)
+            if not isinstance(raw_prev, dict):
+                legacy = pool_states.get(pool)
+                raw_prev = legacy if isinstance(legacy, dict) and legacy.get("account_key") == account_key else None
+        else:
+            legacy = pool_states.get(pool)
+            raw_prev = legacy if isinstance(legacy, dict) and not legacy.get("account_key") else None
+        prev_pool_state: Optional[Dict[str, Any]] = dict(raw_prev) if isinstance(raw_prev, dict) else None
+
+        probe_errors: List[str] = []
+        should_wake = False
+
+        try:
+            active, reason, meta = evaluate_weekly_activity(
+                weekly_item, check_utc, prev_pool_state, has_explicit_model=has_explicit_model
+            )
+            entry: Dict[str, Any] = {
+                "limit_id": weekly_item["limit_id"],
+                "active_before": active,
+                "reason": reason,
+                **meta,
+                "action": "none",
+            }
+            if (
+                not args.dry_run
+                and reason in CONFIRMED_ACTIVE_REASONS
+                and isinstance(prev_pool_state, dict)
+                and (
+                    prev_pool_state.get("verified_active") is False
+                    or int(prev_pool_state.get("unverified_streak") or 0) > 0
+                )
+            ):
+                prev_pool_state["verified_active"] = True
+                prev_pool_state["unverified_streak"] = 0
+                if account_key:
+                    prev_pool_state["account_key"] = account_key
+                _persist_account_state(account_key, prev_pool_state)
+
+            if args.force and reason in FORCE_OVERRIDABLE_REASONS:
+                budget_block = _check_probe_budget_block(
+                    prev_pool_state, check_utc.timestamp(), has_explicit_model
+                )
+                if budget_block is not None:
+                    active = True
+                    reason = budget_block
+                    entry["active_before"] = True
+                    entry["reason"] = budget_block
+                else:
+                    active = False
+                    reason = "forced"
+                    entry["active_before"] = False
+                    entry["reason"] = "forced"
+            if not active and account_key is None:
+                active = True
+                reason = "missing_account_identity"
+                entry["active_before"] = True
+                entry["reason"] = reason
+            pools_report[pool] = entry
+            should_wake = not active
+        except Exception as exc:
+            probe_errors.append(f"{pool}: invalid weekly window payload: {exc}")
+            pools_report[pool] = {"limit_id": weekly_item.get("limit_id", "codex"), "action": "error", "error": str(exc)}
+
+        active_workspace_id = extract_workspace_account_id(snap_bundle)
+        parsed_config: Optional[Dict[str, Any]] = (
+            snap_bundle["config"] if isinstance(snap_bundle.get("config"), dict) else None
+        )
+        parsed_layers: Optional[List[Dict[str, Any]]] = (
+            snap_bundle["config_layers"] if isinstance(snap_bundle.get("config_layers"), list) else None
+        )
+
+        # Confirm genuine forward drift across two ~2.2s intervals (`t1 < t2 < t3`) on the SAME
+        # account identity before sending a wakeup turn.
+        if should_wake and not args.force:
+            try:
+                t_prev = pools_report[pool].get("resets_at")
+                for _ in range(2):
+                    time.sleep(2.2)
+                    drift_bundle, extra_att = fetch_quota_with_retries(
+                        codex_bin,
+                        env=env,
+                        retry_delays=[],
+                    )
+                    attempts += extra_att
+                    if extract_account_identity_key(drift_bundle) != account_key:
+                        pools_report[pool].update(
+                            {
+                                "active_before": True,
+                                "reason": "account_changed_during_check",
+                            }
+                        )
+                        should_wake = False
+                        break
+                    if isinstance(drift_bundle.get("config"), dict):
+                        parsed_config = drift_bundle["config"]
+                        if isinstance(drift_bundle.get("config_layers"), list):
+                            parsed_layers = drift_bundle["config_layers"]
+                    w_next = extract_weekly_window(drift_bundle["rate_limits"])
+                    drift_utc = dt.datetime.now(dt.timezone.utc)
+                    act_n, rsn_n, meta_n = evaluate_weekly_activity(
+                        w_next, drift_utc, prev_pool_state, has_explicit_model=has_explicit_model
+                    )
+                    t_curr = meta_n.get("resets_at")
+                    if act_n or (isinstance(t_prev, int) and isinstance(t_curr, int) and t_curr <= t_prev):
+                        pools_report[pool].update(
+                            {
+                                "active_before": True,
+                                "reason": rsn_n if act_n else "reset_time_already_locked",
+                                **meta_n,
+                            }
+                        )
+                        should_wake = False
+                        break
+                    weekly_item = w_next
+                    pools_report[pool].update(meta_n)
+                    t_prev = t_curr
+            except Exception as exc:
+                probe_errors.append(f"pre-wakeup drift confirmation failed: {exc}")
+                should_wake = False
+
+        if (
+            should_wake
+            and parsed_config is not None
+            and has_non_user_login_restrictions(parsed_layers, active_account_id=active_workspace_id)
+        ):
+            pools_report[pool].update(
+                {
+                    "active_before": True,
+                    "reason": "system_login_restriction_present",
+                    "action": "none",
+                }
+            )
+            should_wake = False
+
+        if not should_wake and not probe_errors:
+            rec = {
+                "ts": fmt_iso(started_at),
+                "status": "dry_run" if args.dry_run else "ok",
+                "attempts": attempts,
+                "duration_ms": int((time.monotonic() - start_mono) * 1000),
+                "pools": pools_report,
+                "error": None,
+            }
+            if not args.dry_run:
+                append_jsonl_with_rotation(log_path, rec)
+            if not args.quiet:
+                print(json.dumps(rec, ensure_ascii=False))
+            return 0
+
+        may_have_sent_probe = False
+        sent_probe_cleanly = False
+
+        if should_wake:
+            entry = pools_report[pool]
+            prev_streak = _effective_unverified_streak(prev_pool_state, time.time())
+            auth_overrides: List[str] = []
+            model_id = args.model.strip() if (args.model and args.model.strip()) else None
+            effort = args.effort.strip().lower() if (args.effort and args.effort.strip()) else "low"
+            model_source = "explicit" if model_id else "cli_default"
+            try:
+                if parsed_config is None:
+                    raise RuntimeError("Missing `config/read` snapshot required to preserve auth store settings")
+                auth_overrides = build_auth_overrides_from_config(parsed_config)
+            except Exception as exc:
+                err_msg = f"{pool}: pre-wakeup setup failed: {exc}"
+                probe_errors.append(err_msg)
+                entry["action"] = "error"
+                entry["error"] = str(exc)
+
+            if entry.get("action") != "error":
+                if args.dry_run:
+                    entry["action"] = "dry_run_would_wake"
+                    entry["selected_model"] = model_id or "(codex-default)"
+                    entry["selected_effort"] = effort
+                    entry["model_source"] = model_source
+                else:
+                    effective_label = model_id or "(codex-default)"
+                    now_probe_epoch = time.time()
+                    next_streak = prev_streak + 1
+                    next_probe_epochs = _recent_probe_epochs(prev_pool_state, now_probe_epoch) + [now_probe_epoch]
+                    # Persist pending unverified cooldown, streak & rolling 7-day counter BEFORE
+                    # spawning `codex exec` so timeouts, drops, or signals cannot loop every 30m.
+                    pending_state = {
+                        "account_key": account_key,
+                        "last_probe_epoch": now_probe_epoch,
+                        "last_probe_ts": fmt_iso(now_local()),
+                        "probe_epochs": next_probe_epochs,
+                        "model": effective_label,
+                        "model_source": model_source,
+                        "verified_active": False,
+                        "unverified_streak": next_streak,
+                        "locked_resets_at": None,
+                        "locked_reset_time": None,
+                        "used_pct_after": None,
+                    }
+                    _persist_account_state(account_key, pending_state)
+                    may_have_sent_probe = True
+
+                    try:
+                        probe_res, wake_mode = send_wakeup_request(
+                            codex_bin,
+                            model_id=model_id,
+                            effort=effort,
+                            env=env,
+                            auth_overrides=auth_overrides,
+                        )
+                        probe_info: Dict[str, Any] = {
+                            "ok": True,
+                            "mode": wake_mode,
+                            "model": effective_label,
+                            "effort": effort,
+                            "model_source": model_source,
+                            "thread_id": probe_res.get("thread_id"),
+                            "duration_s": round(float(probe_res.get("duration_seconds") or 0.0), 3),
+                            "total_tokens": probe_res.get("total_tokens"),
+                            "response": str(probe_res.get("response") or "").strip()[:80],
+                        }
+                        entry["action"] = "probed"
+                        entry["probe"] = probe_info
+                        sent_probe_cleanly = True
+                    except CodexPreSendError as exc:
+                        may_have_sent_probe = False
+                        _persist_account_state(account_key, prev_pool_state)
+                        probe_errors.append(f"{pool} ({effective_label}): {exc}")
+                        entry["action"] = "probe_failed"
+                        entry["probe"] = {
+                            "ok": False,
+                            "model": effective_label,
+                            "effort": effort,
+                            "model_source": model_source,
+                            "error": str(exc),
+                        }
+                    except Exception as exc:
+                        err_msg = f"{pool} ({effective_label}): wakeup failed: {exc}"
+                        probe_errors.append(err_msg)
+                        entry["action"] = "probe_failed"
+                        entry["probe"] = {
+                            "ok": False,
+                            "model": effective_label,
+                            "effort": effort,
+                            "model_source": model_source,
+                            "error": str(exc),
+                        }
+
+        # Re-check `account/rateLimits/read` whenever a wakeup request may have reached the server.
+        if may_have_sent_probe and not args.dry_run:
+            time.sleep(1.0)
+            recheck_epoch = time.time()
+            try:
+                after_bundle, _ = fetch_quota_with_retries(codex_bin, env=env, retry_delays=[3.0])
+                if extract_account_identity_key(after_bundle) != account_key:
+                    entry = pools_report[pool]
+                    entry["verified_active_after"] = False
+                    entry["reason_after"] = "account_changed_during_recheck"
+                    probe_errors.append(f"{pool}: active Codex account changed before post-wakeup recheck completed")
+                else:
+                    after_w = extract_weekly_window(after_bundle["rate_limits"])
+                    after_utc = dt.datetime.now(dt.timezone.utc)
+                    _, reason_after, meta_after = evaluate_weekly_activity(after_w, after_utc, None)
+                    verified_after = reason_after in CONFIRMED_ACTIVE_REASONS
+                    account_changed_sec = False
+
+                    if not verified_after and reason_after == "unactivated_100pct":
+                        time.sleep(2.5)
+                        sec_bundle, _ = fetch_quota_with_retries(codex_bin, env=env, retry_delays=[2.0])
+                        if extract_account_identity_key(sec_bundle) != account_key:
+                            account_changed_sec = True
+                        else:
+                            sec_w = extract_weekly_window(sec_bundle["rate_limits"])
+                            sec_utc = dt.datetime.now(dt.timezone.utc)
+                            _, reason2, meta2 = evaluate_weekly_activity(sec_w, sec_utc, None)
+                            verified2 = reason2 in CONFIRMED_ACTIVE_REASONS
+                            t1 = meta_after.get("resets_at")
+                            t2 = meta2.get("resets_at")
+                            if (
+                                not verified2
+                                and reason2 == "unactivated_100pct"
+                                and isinstance(t1, int)
+                                and isinstance(t2, int)
+                                and int(sec_utc.timestamp()) < t2
+                                and abs(t2 - t1) <= 1
+                            ):
+                                verified2 = True
+                                reason2 = "reset_time_locked"
+                            verified_after, reason_after, meta_after = verified2, reason2, meta2
+
+                    entry = pools_report[pool]
+                    if account_changed_sec:
+                        entry["verified_active_after"] = False
+                        entry["reason_after"] = "account_changed_during_recheck"
+                        probe_errors.append(
+                            f"{pool}: active Codex account changed before post-wakeup recheck completed"
+                        )
+                    else:
+                        confirmed_after = reason_after in CONFIRMED_ACTIVE_REASONS
+                        entry["verified_active_after"] = verified_after
+                        entry["reason_after"] = reason_after
+                        entry["used_pct_after"] = meta_after["used_pct"]
+                        entry["remaining_pct_after"] = meta_after["remaining_pct"]
+                        entry["resets_at_after"] = meta_after["resets_at"]
+                        entry["reset_time_after"] = meta_after["reset_time"]
+
+                        cur_saved = (account_states.get(account_key) if account_key else pool_states.get(pool)) or {}
+                        used_src = entry["probe"]["model_source"]
+
+                        # Preserve `unverified_streak` on 2-sample `reset_time_locked` until a later
+                        # check independently observes `CONFIRMED_ACTIVE_REASONS` (`used_above_0pct`
+                        # or `reset_timer_counting_down`), preventing false-lock resend loops.
+                        updated_state = {
+                            "account_key": account_key,
+                            "last_probe_epoch": recheck_epoch,
+                            "last_probe_ts": fmt_iso(now_local()),
+                            "probe_epochs": _recent_probe_epochs(cur_saved, recheck_epoch),
+                            "model": entry["probe"]["model"],
+                            "model_source": used_src,
+                            "verified_active": verified_after,
+                            "unverified_streak": (
+                                0 if confirmed_after else int(cur_saved.get("unverified_streak") or 1)
+                            ),
+                            "locked_resets_at": meta_after["resets_at"] if verified_after else None,
+                            "locked_reset_time": meta_after["reset_time"] if verified_after else None,
+                            "used_pct_after": meta_after["used_pct"],
+                        }
+                        _persist_account_state(account_key, updated_state)
+                        if sent_probe_cleanly and not verified_after:
+                            probe_errors.append(
+                                f"{pool}: wakeup request sent ({entry['probe']['model']}) but 7-day timer did not lock (reason={reason_after})"
+                            )
+            except Exception as exc:
+                probe_errors.append(f"post-wakeup rate-limit recheck failed: {exc}")
+
+        if probe_errors and sent_probe_cleanly:
+            overall_status = "partial_error"
+        elif probe_errors:
+            overall_status = "error"
+        elif args.dry_run:
+            overall_status = "dry_run"
+        else:
+            overall_status = "activated"
+
+        rec = {
+            "ts": fmt_iso(started_at),
+            "status": overall_status,
+            "attempts": attempts,
+            "duration_ms": int((time.monotonic() - start_mono) * 1000),
+            "pools": pools_report,
+            "error": "; ".join(probe_errors) if probe_errors else None,
+        }
+        if not args.dry_run:
+            append_jsonl_with_rotation(log_path, rec)
+        if not args.quiet:
+            stream = sys.stderr if overall_status in ("error", "partial_error") else sys.stdout
+            print(json.dumps(rec, ensure_ascii=False), file=stream)
+        return 1 if overall_status in ("error", "partial_error") else 0
+    finally:
+        if prev_sigterm is not None:
+            signal.signal(signal.SIGTERM, prev_sigterm)
+        if prev_sigint is not None:
+            signal.signal(signal.SIGINT, prev_sigint)
+        lock_fh.close()
+
+
+# ---------------------------------------------------------------------------
+# OS Scheduler Management (macOS launchd & Linux systemd --user)
+# ---------------------------------------------------------------------------
+
+
+def preferred_self_executable() -> str:
+    # Deliberately invoke the executable script directly via its `#!/usr/bin/env python3`
+    # shebang + persisted PATH rather than hardcoding `sys.executable` into launchd/systemd:
+    # on macOS Homebrew, `sys.executable` resolves into versioned `/opt/homebrew/Cellar/python@...`
+    # directories that disappear on `brew upgrade python`, breaking scheduled jobs silently.
+    self_real = Path(__file__).resolve()
+    linked = Path.home() / ".local" / "bin" / APP_NAME
+    try:
+        if linked.exists() and os.path.samefile(linked, self_real):
+            return str(linked)
+    except OSError:
+        pass
+    return str(self_real)
+
+
+def launchd_plist_path() -> Path:
+    return Path.home() / "Library" / "LaunchAgents" / f"{LAUNCHD_LABEL}.plist"
+
+
+def calendar_minutes_for_interval(interval: int, offset_minute: int = CALENDAR_MINUTE_OFFSET) -> Optional[List[int]]:
+    """Return sorted wall-clock minutes within each hour when `interval` divides 1h cleanly."""
+    if interval <= 0 or interval % 60 != 0:
+        return None
+    step_min = interval // 60
+    if step_min < 1 or step_min > 60 or 60 % step_min != 0:
+        return None
+    start = offset_minute % step_min
+    return [start + k * step_min for k in range(60 // step_min)]
+
+
+def describe_schedule(interval: int, offset_minute: int = CALENDAR_MINUTE_OFFSET) -> str:
+    mins = calendar_minutes_for_interval(interval, offset_minute=offset_minute)
+    if mins:
+        ticks = ",".join(f":{m:02d}" for m in mins)
+        return f"every {interval // 60}m (hourly at {ticks})"
+    return f"every {interval}s"
+
+
+def build_launchd_plist(
+    interval: int,
+    state_dir: Path,
+    codex_bin: Optional[str] = None,
+    model_id: Optional[str] = None,
+    custom_state_dir: Optional[Path] = None,
+    custom_codex_home: Optional[Path] = None,
+    offset_minute: int = CALENDAR_MINUTE_OFFSET,
+) -> Dict[str, Any]:
+    env = build_clean_env()
+    if codex_bin:
+        ensure_bin_dir_in_path(env, codex_bin)
+    prog_args = [
+        preferred_self_executable(),
+        "run",
+        "--quiet",
+    ]
+    if codex_bin:
+        prog_args += ["--codex-bin", codex_bin]
+    if model_id:
+        prog_args += ["--model", model_id]
+    env_vars: Dict[str, str] = {
+        "HOME": env["HOME"],
+        "PATH": env["PATH"],
+        "LANG": env["LANG"],
+    }
+    effective_custom_state = custom_state_dir if custom_state_dir is not None else custom_state_dir_override()
+    if effective_custom_state is not None:
+        env_vars["CODEX_QUOTA_WAKEUP_STATE_DIR"] = str(effective_custom_state)
+    effective_codex_home = custom_codex_home if custom_codex_home is not None else custom_codex_home_override()
+    if effective_codex_home is not None:
+        env_vars["CODEX_HOME"] = str(effective_codex_home)
+    plist: Dict[str, Any] = {
+        "Label": LAUNCHD_LABEL,
+        "ProcessType": "Background",
+        "ProgramArguments": prog_args,
+        "RunAtLoad": True,
+        "EnvironmentVariables": env_vars,
+        "StandardErrorPath": str(state_dir / "launchd-stderr.log"),
+    }
+    mins = calendar_minutes_for_interval(interval, offset_minute=offset_minute)
+    if mins:
+        plist["StartCalendarInterval"] = [{"Minute": m} for m in mins]
+    else:
+        plist["StartInterval"] = int(interval)
+    return plist
+
+
+def systemd_user_unit_paths() -> Tuple[Path, Path]:
+    xdg_cfg = os.environ.get("XDG_CONFIG_HOME")
+    base = Path(xdg_cfg).expanduser() if xdg_cfg else (Path.home() / ".config")
+    unit_dir = base / "systemd" / "user"
+    return (
+        unit_dir / f"{SYSTEMD_UNIT_BASE}.service",
+        unit_dir / f"{SYSTEMD_UNIT_BASE}.timer",
+    )
+
+
+def _systemd_env_assignment(key: str, val: str) -> str:
+    escaped = val.replace("\\", "\\\\").replace('"', '\\"').replace("%", "%%")
+    return f'Environment="{key}={escaped}"'
+
+
+def _systemd_exec_arg(val: str) -> str:
+    spec_safe = val.replace("%", "%%")
+    if re.match(r"^[A-Za-z0-9_./:@+=-]+$", spec_safe):
+        return spec_safe
+    escaped = spec_safe.replace("\\", "\\\\").replace('"', '\\"').replace("$", "$$")
+    return f'"{escaped}"'
+
+
+def build_systemd_units(
+    interval: int,
+    codex_bin: Optional[str] = None,
+    model_id: Optional[str] = None,
+    custom_state_dir: Optional[Path] = None,
+    custom_codex_home: Optional[Path] = None,
+    disable_proxy: bool = False,
+    offset_minute: int = CALENDAR_MINUTE_OFFSET,
+) -> Tuple[str, str]:
+    env = build_clean_env()
+    if codex_bin:
+        ensure_bin_dir_in_path(env, codex_bin)
+    exe = _systemd_exec_arg(preferred_self_executable())
+    extra = ""
+    if codex_bin:
+        extra += f" --codex-bin {_systemd_exec_arg(codex_bin)}"
+    if model_id:
+        extra += f" --model {_systemd_exec_arg(model_id)}"
+    unset_keys: List[str] = []
+    env_lines = [
+        _systemd_env_assignment("HOME", env["HOME"]),
+        _systemd_env_assignment("PATH", env["PATH"]),
+        _systemd_env_assignment("LANG", env["LANG"]),
+    ]
+    effective_custom_state = custom_state_dir if custom_state_dir is not None else custom_state_dir_override()
+    if effective_custom_state is not None:
+        env_lines.append(_systemd_env_assignment("CODEX_QUOTA_WAKEUP_STATE_DIR", str(effective_custom_state)))
+    else:
+        unset_keys.append("CODEX_QUOTA_WAKEUP_STATE_DIR")
+    effective_codex_home = custom_codex_home if custom_codex_home is not None else custom_codex_home_override()
+    if effective_codex_home is not None:
+        env_lines.append(_systemd_env_assignment("CODEX_HOME", str(effective_codex_home)))
+    else:
+        unset_keys.append("CODEX_HOME")
+    if disable_proxy:
+        unset_keys.extend(UPSTREAM_PROXY_KEYS + NO_PROXY_KEYS)
+    if unset_keys:
+        env_lines.insert(0, f"UnsetEnvironment={' '.join(unset_keys)}")
+    env_block = "\n".join(env_lines)
+    service_text = (
+        "[Unit]\n"
+        "Description=Codex weekly quota reset detector and wakeup tool\n\n"
+        "[Service]\n"
+        "Type=oneshot\n"
+        "TimeoutStartSec=960\n"
+        "Nice=19\n"
+        f"{env_block}\n"
+        f"ExecStart={exe} run --quiet{extra}\n"
+    )
+    mins = calendar_minutes_for_interval(interval, offset_minute=offset_minute)
+    if mins:
+        min_spec = ",".join(f"{m:02d}" for m in mins)
+        trigger_line = f"OnCalendar=*-*-* *:{min_spec}:00\n"
+    else:
+        trigger_line = f"OnUnitActiveSec={int(interval)}s\n"
+    timer_text = (
+        "[Unit]\n"
+        "Description=Periodic check to wake up reset Codex weekly quota windows\n\n"
+        "[Timer]\n"
+        "OnStartupSec=45s\n"
+        f"{trigger_line}"
+        "Persistent=true\n\n"
+        "[Install]\n"
+        "WantedBy=timers.target\n"
+    )
+    return service_text, timer_text
+
+
+def current_username() -> str:
+    for key in ("USER", "LOGNAME"):
+        val = (os.environ.get(key) or "").strip()
+        if val:
+            return val
+    try:
+        return pwd.getpwuid(os.getuid()).pw_name
+    except Exception:
+        return str(os.getuid())
+
+
+def linux_linger_status() -> str:
+    """Return 'yes', 'no', or 'unknown' for the current Linux user's systemd linger state."""
+    if shutil.which("loginctl"):
+        try:
+            proc = subprocess.run(
+                ["loginctl", "show-user", str(os.getuid()), "-p", "Linger"],
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            if proc.returncode == 0:
+                out = (proc.stdout or "").strip().lower()
+                if out in ("linger=yes", "yes"):
+                    return "yes"
+                if out in ("linger=no", "no"):
+                    return "no"
+        except Exception:
+            pass
+    linger_marker = Path("/var/lib/systemd/linger") / current_username()
+    try:
+        if linger_marker.exists():
+            return "yes"
+    except OSError:
+        pass
+    return "unknown"
+
+
+def _run_scheduler_cmd(cmd: Sequence[str], timeout_s: float = 15.0) -> subprocess.CompletedProcess:
+    try:
+        return subprocess.run(
+            list(cmd),
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=timeout_s,
+        )
+    except subprocess.TimeoutExpired:
+        return subprocess.CompletedProcess(list(cmd), 124, "", f"command timed out after {timeout_s:.0f}s")
+
+
+def ensure_linux_linger() -> str:
+    """Ensure systemd user timer survives SSH logout on Linux servers; never fail install."""
+    before = linux_linger_status()
+    if before == "yes":
+        return "enabled (timer stays active after SSH logout)"
+    user = current_username()
+    if before == "no" and shutil.which("loginctl"):
+        try:
+            proc = _run_scheduler_cmd(["loginctl", "--no-ask-password", "enable-linger"], timeout_s=10.0)
+            if proc.returncode == 0 or linux_linger_status() == "yes":
+                return "enabled via loginctl (timer stays active after SSH logout)"
+            detail = (proc.stderr or proc.stdout or "").strip() or f"exit code {proc.returncode}"
+        except Exception as exc:
+            detail = str(exc)
+        return f"NOT enabled ({detail}); run `sudo loginctl enable-linger {shlex.quote(user)}` so timer survives SSH logout"
+    return (
+        f"unknown (if running on a remote SSH server, verify `loginctl show-user {shlex.quote(user)} -p Linger` "
+        f"or run `sudo loginctl enable-linger {shlex.quote(user)}`)"
+    )
+
+
+def systemd_user_available() -> Tuple[bool, str]:
+    if not shutil.which("systemctl"):
+        return False, "`systemctl` not found"
+    try:
+        proc = _run_scheduler_cmd(["systemctl", "--user", "show-environment"], timeout_s=5.0)
+    except Exception as exc:
+        return False, str(exc)
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout or "").strip()
+        return False, detail or f"exit code {proc.returncode}"
+    return True, ""
+
+
+def persist_install_proxy_env(state_dir: Path, disable_proxy: bool) -> Tuple[Dict[str, str], bool]:
+    """Save or clear proxy.json (0600) before launching background tasks. Returns (saved_map, cleared_existing)."""
+    pfile = proxy_config_path(state_dir)
+    prev_saved = load_saved_proxy_env(state_dir)
+    had_existing = pfile.exists()
+    if disable_proxy:
+        prev_ca = {k: v for k, v in prev_saved.items() if k in CA_CERT_KEYS}
+        live_ca = {k: v for k, v in os.environ.items() if k in CA_CERT_KEYS and (v or "").strip()}
+        captured = capture_proxy_env(live_ca if live_ca else prev_ca)
+        cleared_upstream = any(k not in CA_CERT_KEYS for k in prev_saved)
+        if captured:
+            atomic_write_json(pfile, {"env": captured})
+            return captured, cleared_upstream
+    else:
+        captured = capture_proxy_env(os.environ)
+        if captured:
+            atomic_write_json(pfile, {"env": captured})
+            return captured, False
+    if had_existing:
+        try:
+            pfile.unlink()
+            return {}, True
+        except FileNotFoundError:
+            return {}, False
+    return {}, False
+
+
+def _is_macos_tcc_protected_path(path_str: str) -> bool:
+    try:
+        resolved = Path(path_str).resolve()
+        home = Path.home().resolve()
+        for folder in ("Downloads", "Desktop", "Documents"):
+            protected = home / folder
+            if resolved == protected or protected in resolved.parents:
+                return True
+    except OSError:
+        pass
+    return False
+
+
+def _install_macos(
+    interval: int,
+    state_dir: Path,
+    codex_bin: Optional[str],
+    model_id: Optional[str] = None,
+    disable_proxy: bool = False,
+    offset_minute: int = CALENDAR_MINUTE_OFFSET,
+) -> Tuple[int, Dict[str, str], bool]:
+    domain = f"gui/{os.getuid()}"
+    domain_target = f"{domain}/{LAUNCHD_LABEL}"
+    self_exe = preferred_self_executable()
+    if _is_macos_tcc_protected_path(self_exe):
+        print(
+            f"Warning: {self_exe} is inside a macOS privacy-protected folder (Downloads/Desktop/Documents).\n"
+            f"Background launchd jobs may be blocked by macOS TCC; move the script to ~/.local/bin/{APP_NAME} and re-run install.",
+            file=sys.stderr,
+        )
+    domain_chk = _run_scheduler_cmd(["launchctl", "print", domain])
+    if domain_chk.returncode != 0:
+        detail = (domain_chk.stderr or domain_chk.stdout or "").strip() or f"exit code {domain_chk.returncode}"
+        print(
+            f"macOS LaunchAgent GUI domain {domain} is unavailable ({detail}).\n"
+            "Log into the macOS graphical desktop session and re-run `install`.",
+            file=sys.stderr,
+        )
+        return 1, {}, False
+
+    plist_path = launchd_plist_path()
+    prev_plist_bytes: Optional[bytes] = None
+    if plist_path.is_file():
+        try:
+            prev_plist_bytes = plist_path.read_bytes()
+        except OSError:
+            prev_plist_bytes = None
+    pfile = proxy_config_path(state_dir)
+    prev_proxy_bytes: Optional[bytes] = None
+    if pfile.is_file():
+        try:
+            prev_proxy_bytes = pfile.read_bytes()
+        except OSError:
+            prev_proxy_bytes = None
+    was_loaded = _run_scheduler_cmd(["launchctl", "print", domain_target]).returncode == 0
+
+    saved_proxy, cleared_proxy = persist_install_proxy_env(state_dir, disable_proxy=disable_proxy)
+    plist_data = build_launchd_plist(
+        interval, state_dir, codex_bin=codex_bin, model_id=model_id, offset_minute=offset_minute
+    )
+    _atomic_write_bytes(plist_path, plistlib.dumps(plist_data, sort_keys=True), mode=0o644)
+
+    _run_scheduler_cmd(["launchctl", "bootout", domain_target])
+    _run_scheduler_cmd(["launchctl", "enable", domain_target])
+    boot = None
+    for attempt in range(4):
+        boot = _run_scheduler_cmd(["launchctl", "bootstrap", domain, str(plist_path)])
+        if boot.returncode == 0:
+            break
+        if attempt < 3:
+            time.sleep(0.4)
+    assert boot is not None
+    if boot.returncode != 0:
+        detail = (boot.stderr or boot.stdout or "").strip()
+        if prev_proxy_bytes is not None:
+            try:
+                _atomic_write_bytes(pfile, prev_proxy_bytes, mode=0o600)
+            except OSError:
+                pass
+        elif saved_proxy:
+            try:
+                pfile.unlink()
+            except OSError:
+                pass
+        if prev_plist_bytes is not None:
+            try:
+                _atomic_write_bytes(plist_path, prev_plist_bytes, mode=0o644)
+                if was_loaded:
+                    _run_scheduler_cmd(["launchctl", "bootstrap", domain, str(plist_path)])
+            except OSError:
+                pass
+        else:
+            try:
+                plist_path.unlink()
+            except OSError:
+                pass
+        print(f"launchctl bootstrap failed ({boot.returncode}): {detail}", file=sys.stderr)
+        return 1, {}, False
+
+    print(f"Installed and loaded LaunchAgent {LAUNCHD_LABEL}")
+    print(f"  Plist:    {plist_path}")
+    print(f"  Schedule: {describe_schedule(interval, offset_minute=offset_minute)} (and RunAtLoad=true)")
+    if model_id:
+        print(f"  Model:    {model_id}")
+    print(f"  Log:      {state_dir / 'wakeup.jsonl'}")
+    return 0, saved_proxy, cleared_proxy
+
+
+def _install_linux(
+    interval: int,
+    state_dir: Path,
+    codex_bin: Optional[str],
+    resolved_codex_bin: Optional[str] = None,
+    model_id: Optional[str] = None,
+    disable_proxy: bool = False,
+    offset_minute: int = CALENDAR_MINUTE_OFFSET,
+) -> Tuple[int, Dict[str, str], bool]:
+    service_path, timer_path = systemd_user_unit_paths()
+    has_existing_units = service_path.exists() or timer_path.exists()
+    ok, reason = systemd_user_available()
+    if not ok:
+        if has_existing_units:
+            print(
+                f"systemd --user is unreachable ({reason}) while {SYSTEMD_UNIT_BASE} units already exist.\n"
+                "Refusing to overwrite runtime proxy state; if you switched users via `su`/`sudo`, log in directly over SSH and retry.",
+                file=sys.stderr,
+            )
+            return 1, {}, False
+        saved_proxy, cleared_proxy = persist_install_proxy_env(state_dir, disable_proxy=disable_proxy)
+        clean_env = build_clean_env()
+        cron_codex = codex_bin or resolved_codex_bin
+        if cron_codex:
+            ensure_bin_dir_in_path(clean_env, cron_codex)
+        exe = shlex.quote(preferred_self_executable())
+        extra = f" --codex-bin {shlex.quote(cron_codex)}" if cron_codex else ""
+        if model_id:
+            extra += f" --model {shlex.quote(model_id)}"
+        env_parts: List[str] = [f"PATH={shlex.quote(clean_env['PATH'])}"]
+        custom_state = custom_state_dir_override()
+        if custom_state:
+            env_parts.append(f"CODEX_QUOTA_WAKEUP_STATE_DIR={shlex.quote(str(custom_state))}")
+        custom_home = custom_codex_home_override()
+        if custom_home:
+            env_parts.append(f"CODEX_HOME={shlex.quote(str(custom_home))}")
+        env_prefix = " ".join(env_parts) + " "
+        mins = calendar_minutes_for_interval(interval, offset_minute=offset_minute)
+        fallback_mins = calendar_minutes_for_interval(DEFAULT_INTERVAL_SECONDS, offset_minute=offset_minute) or [3, 33]
+        cron_min = ",".join(str(m) for m in (mins or fallback_mins))
+        cron_note = "" if mins else " (default 30m schedule example; adjust cron fields if needed)"
+        cron_cmd = f"{env_prefix}{exe} run --quiet{extra}".replace("%", "\\%")
+        print(
+            f"systemd --user is not active in this Linux environment ({reason}).\n"
+            "Skipped writing scheduler units to avoid touching system/cron files.\n"
+            "If you switched users via `su`/`sudo`, log in directly via SSH and retry;\n"
+            "otherwise enable systemd (e.g. `[boot] systemd=true` in `/etc/wsl.conf` on WSL2),\n"
+            f"or add a user cron entry manually with `crontab -e`{cron_note}:\n"
+            f"  {cron_min} * * * * {cron_cmd}",
+            file=sys.stderr,
+        )
+        return 1, saved_proxy, cleared_proxy
+
+    pfile = proxy_config_path(state_dir)
+    prev_proxy_bytes = pfile.read_bytes() if pfile.is_file() else None
+    prev_service_bytes = service_path.read_bytes() if service_path.is_file() else None
+    prev_timer_bytes = timer_path.read_bytes() if timer_path.is_file() else None
+
+    saved_proxy, cleared_proxy = persist_install_proxy_env(state_dir, disable_proxy=disable_proxy)
+    service_text, timer_text = build_systemd_units(
+        interval,
+        codex_bin=codex_bin,
+        model_id=model_id,
+        disable_proxy=disable_proxy,
+        offset_minute=offset_minute,
+    )
+    atomic_write_text(service_path, service_text, mode=0o644)
+    atomic_write_text(timer_path, timer_text, mode=0o644)
+
+    for subcmd in (
+        ["systemctl", "--user", "daemon-reload"],
+        ["systemctl", "--user", "enable", "--now", f"{SYSTEMD_UNIT_BASE}.timer"],
+        ["systemctl", "--user", "start", "--no-block", f"{SYSTEMD_UNIT_BASE}.service"],
+    ):
+        proc = _run_scheduler_cmd(subcmd)
+        if proc.returncode != 0:
+            detail = (proc.stderr or proc.stdout or "").strip()
+            for target_p, old_b, fmode in (
+                (pfile, prev_proxy_bytes, 0o600),
+                (service_path, prev_service_bytes, 0o644),
+                (timer_path, prev_timer_bytes, 0o644),
+            ):
+                try:
+                    if old_b is not None:
+                        _atomic_write_bytes(target_p, old_b, mode=fmode)
+                    elif target_p.exists():
+                        target_p.unlink()
+                except OSError:
+                    pass
+            _run_scheduler_cmd(["systemctl", "--user", "daemon-reload"])
+            print(f"{' '.join(subcmd)} failed ({proc.returncode}): {detail}", file=sys.stderr)
+            return 1, {}, False
+
+    linger_note = ensure_linux_linger()
+
+    print(f"Installed and enabled user timer {SYSTEMD_UNIT_BASE}.timer")
+    print(f"  Service:  {service_path}")
+    print(f"  Timer:    {timer_path}")
+    print(f"  Schedule: {describe_schedule(interval, offset_minute=offset_minute)} (Persistent=true)")
+    if linger_note:
+        print(f"  Linger:   {linger_note}")
+    if model_id:
+        print(f"  Model:    {model_id}")
+    print(f"  Log:      {state_dir / 'wakeup.jsonl'}")
+    return 0, saved_proxy, cleared_proxy
+
+
+def execute_install(args: argparse.Namespace) -> int:
+    if args.interval < 60:
+        print("--interval must be at least 60 seconds.", file=sys.stderr)
+        return 2
+    if not (0 <= args.minute_offset <= 59):
+        print("--minute-offset must be between 0 and 59.", file=sys.stderr)
+        return 2
+
+    state_dir = default_state_dir()
+    clean_env = build_clean_env(state_dir=state_dir)
+    try:
+        resolved_codex = resolve_codex_bin(args.codex_bin, clean_env)
+        ensure_bin_dir_in_path(clean_env, resolved_codex)
+        ensure_min_codex_version(resolved_codex, clean_env)
+    except FileNotFoundError as exc:
+        print(f"{exc}\nPass `--codex-bin /path/to/codex` if `codex` is installed in a custom location.", file=sys.stderr)
+        return 1
+    except RuntimeError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+
+    self_exe = preferred_self_executable()
+    if not os.access(self_exe, os.X_OK):
+        try:
+            os.chmod(self_exe, os.stat(self_exe).st_mode | 0o111)
+        except OSError:
+            pass
+        if not os.access(self_exe, os.X_OK):
+            print(f"Script is not executable: {self_exe}\nRun: chmod +x {shlex.quote(self_exe)}", file=sys.stderr)
+            return 1
+
+    persisted_codex_bin = resolved_codex if args.codex_bin is not None else None
+    persisted_model = args.model.strip() if (args.model and args.model.strip()) else None
+    state_dir.mkdir(parents=True, exist_ok=True)
+    disable_proxy = bool(args.no_proxy)
+
+    sys_name = platform.system()
+    if sys_name == "Darwin":
+        rc, saved_proxy, cleared_proxy = _install_macos(
+            args.interval,
+            state_dir,
+            codex_bin=persisted_codex_bin,
+            model_id=persisted_model,
+            disable_proxy=disable_proxy,
+            offset_minute=args.minute_offset,
+        )
+    elif sys_name == "Linux":
+        rc, saved_proxy, cleared_proxy = _install_linux(
+            args.interval,
+            state_dir,
+            codex_bin=persisted_codex_bin,
+            resolved_codex_bin=resolved_codex,
+            model_id=persisted_model,
+            disable_proxy=disable_proxy,
+            offset_minute=args.minute_offset,
+        )
+    else:
+        print(f"install is only supported on macOS and Linux (current OS: {sys_name}).", file=sys.stderr)
+        return 2
+
+    if saved_proxy:
+        print(f"  Proxy:    inherited {format_proxy_summary(saved_proxy)} (saved in 0600 {PROXY_CONFIG_FILENAME})")
+    elif cleared_proxy:
+        print(f"  Proxy:    cleared previous {PROXY_CONFIG_FILENAME}")
+    if rc == 0:
+        print(f"  Verify:   run `{APP_NAME} status` in a few seconds to confirm the initial check succeeded")
+    return rc
+
+
+def _remove_saved_proxy_file() -> None:
+    pfile = proxy_config_path(default_state_dir())
+    try:
+        pfile.unlink()
+    except FileNotFoundError:
+        pass
+
+
+def execute_uninstall(_args: argparse.Namespace) -> int:
+    sys_name = platform.system()
+    if sys_name == "Darwin":
+        domain = f"gui/{os.getuid()}"
+        domain_target = f"{domain}/{LAUNCHD_LABEL}"
+        plist_path = launchd_plist_path()
+        bootout = _run_scheduler_cmd(["launchctl", "bootout", domain_target])
+        still_loaded = False
+        for _ in range(3):
+            chk = _run_scheduler_cmd(["launchctl", "print", domain_target])
+            if chk.returncode != 0:
+                still_loaded = False
+                break
+            still_loaded = True
+            time.sleep(0.3)
+        bootout_detail = (bootout.stderr or bootout.stdout or "").strip()
+        benign_absent = any(
+            tok in bootout_detail.lower()
+            for tok in ("no such process", "could not find specified service", "not found")
+        )
+        if still_loaded or (plist_path.exists() and bootout.returncode != 0 and not benign_absent):
+            detail = bootout_detail or f"exit code {bootout.returncode}"
+            print(f"Failed to unload {LAUNCHD_LABEL}: {detail}", file=sys.stderr)
+            return 1
+        if plist_path.exists():
+            plist_path.unlink()
+            print(f"Unloaded and removed {plist_path}")
+        else:
+            print(f"{LAUNCHD_LABEL} was not installed at {plist_path}")
+        _remove_saved_proxy_file()
+        return 0
+
+    if sys_name == "Linux":
+        service_path, timer_path = systemd_user_unit_paths()
+        has_units = timer_path.exists() or service_path.exists()
+        systemd_ok = False
+        if not shutil.which("systemctl"):
+            if has_units:
+                print(
+                    f"Cannot stop {SYSTEMD_UNIT_BASE}.timer because `systemctl` was not found in PATH.",
+                    file=sys.stderr,
+                )
+                return 1
+        else:
+            systemd_ok, reason = systemd_user_available()
+            if not systemd_ok and has_units:
+                print(
+                    f"Cannot stop {SYSTEMD_UNIT_BASE}.timer because systemd --user is unreachable ({reason}).",
+                    file=sys.stderr,
+                )
+                return 1
+            if systemd_ok:
+                dis = _run_scheduler_cmd(["systemctl", "--user", "disable", "--now", f"{SYSTEMD_UNIT_BASE}.timer"])
+                stp = _run_scheduler_cmd(["systemctl", "--user", "stop", f"{SYSTEMD_UNIT_BASE}.service"])
+                _run_scheduler_cmd(["systemctl", "--user", "reset-failed", f"{SYSTEMD_UNIT_BASE}.service"])
+                show_timer = _run_scheduler_cmd(
+                    [
+                        "systemctl",
+                        "--user",
+                        "show",
+                        "-p",
+                        "LoadState",
+                        "-p",
+                        "ActiveState",
+                        "-p",
+                        "UnitFileState",
+                        f"{SYSTEMD_UNIT_BASE}.timer",
+                    ]
+                )
+                show_svc = _run_scheduler_cmd(
+                    [
+                        "systemctl",
+                        "--user",
+                        "show",
+                        "-p",
+                        "LoadState",
+                        "-p",
+                        "ActiveState",
+                        f"{SYSTEMD_UNIT_BASE}.service",
+                    ]
+                )
+                t_props = dict(
+                    line.split("=", 1) for line in (show_timer.stdout or "").splitlines() if "=" in line
+                )
+                s_props = dict(
+                    line.split("=", 1) for line in (show_svc.stdout or "").splitlines() if "=" in line
+                )
+                timer_stopped = (
+                    show_timer.returncode == 0
+                    and (
+                        t_props.get("LoadState") == "not-found"
+                        or t_props.get("ActiveState") in ("inactive", "failed")
+                    )
+                    and t_props.get("UnitFileState") not in ("enabled", "enabled-runtime")
+                )
+                svc_stopped = show_svc.returncode == 0 and (
+                    s_props.get("LoadState") == "not-found"
+                    or s_props.get("ActiveState") in ("inactive", "failed")
+                )
+                if not (timer_stopped and svc_stopped):
+                    detail = (
+                        (dis.stderr or stp.stderr or show_timer.stderr or show_svc.stderr or "").strip()
+                        or (
+                            f"timer={t_props.get('ActiveState', 'unknown')}/"
+                            f"{t_props.get('UnitFileState', 'unknown')}, "
+                            f"service={s_props.get('ActiveState', 'unknown')}"
+                        )
+                    )
+                    print(f"Failed to disable/stop {SYSTEMD_UNIT_BASE} units: {detail}", file=sys.stderr)
+                    return 1
+        removed = False
+        for p in (timer_path, service_path):
+            if p.exists():
+                p.unlink()
+                removed = True
+        if systemd_ok:
+            reload_proc = _run_scheduler_cmd(["systemctl", "--user", "daemon-reload"])
+            if reload_proc.returncode != 0:
+                detail = (reload_proc.stderr or reload_proc.stdout or "").strip() or f"exit code {reload_proc.returncode}"
+                print(f"systemctl --user daemon-reload failed: {detail}", file=sys.stderr)
+                return 1
+        _remove_saved_proxy_file()
+        if removed:
+            print(f"Disabled and removed {timer_path} and {service_path}")
+        else:
+            print(f"{SYSTEMD_UNIT_BASE} systemd user units were not installed")
+        return 0
+
+    print(f"uninstall is only supported on macOS and Linux (current OS: {sys_name}).", file=sys.stderr)
+    return 2
+
+
+def read_all_log_records(state_dir: Path) -> List[Dict[str, Any]]:
+    records: List[Dict[str, Any]] = []
+    for name in ("wakeup.jsonl.1", "wakeup.jsonl"):
+        p = state_dir / name
+        if not p.is_file():
+            continue
+        try:
+            with p.open("r", encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    s = line.strip()
+                    if not s:
+                        continue
+                    try:
+                        obj = json.loads(s)
+                        if isinstance(obj, dict):
+                            records.append(obj)
+                    except json.JSONDecodeError:
+                        continue
+        except OSError:
+            continue
+    return records
+
+
+def record_has_probe(rec: Dict[str, Any]) -> bool:
+    if rec.get("status") == "activated":
+        return True
+    pools = rec.get("pools")
+    if isinstance(pools, dict):
+        return any(isinstance(v, dict) and v.get("action") == "probed" for v in pools.values())
+    return False
+
+
+def format_record_line(rec: Dict[str, Any]) -> str:
+    ts = rec.get("ts", "?")
+    status = rec.get("status", "?")
+    dur = rec.get("duration_ms", "?")
+    pools = rec.get("pools")
+    parts: List[str] = []
+    if isinstance(pools, dict):
+        info = pools.get("codex")
+        if isinstance(info, dict):
+            pct = info.get("remaining_pct_after", info.get("remaining_pct", "?"))
+            rst = info.get("reset_time_after", info.get("reset_time", "?"))
+            act = info.get("action", "none")
+            if act == "probed":
+                probe_meta = info.get("probe") or {}
+                model = probe_meta.get("model", "?")
+                mode = probe_meta.get("mode", "ephemeral_exec")
+                ver = info.get("verified_active_after")
+                mode_tag = f",{mode}" if mode != "ephemeral_exec" else ""
+                label = "ACTIVATED" if ver is True else "WAKE_SENT"
+                parts.append(f"codex:{label}({model}{mode_tag},verified={ver})->{pct}%@{rst}")
+            elif act != "none":
+                parts.append(f"codex:{act}({pct}%@{rst})")
+            else:
+                parts.append(f"codex:{pct}%@{rst}")
+    err = rec.get("error")
+    summary = " | ".join(parts) if parts else ""
+    if err:
+        summary = f"{summary} | err={err}" if summary else f"err={err}"
+    return f"{ts}  [{status}] ({dur}ms)  {summary}".rstrip()
+
+
+def execute_status(args: argparse.Namespace) -> int:
+    state_dir = default_state_dir()
+    log_path = state_dir / "wakeup.jsonl"
+    sys_name = platform.system()
+
+    print(f"State dir: {state_dir}")
+    print(f"Log file:  {log_path}")
+
+    if sys_name == "Darwin":
+        plist_path = launchd_plist_path()
+        domain_target = f"gui/{os.getuid()}/{LAUNCHD_LABEL}"
+        proc = _run_scheduler_cmd(["launchctl", "print", domain_target])
+        loaded = proc.returncode == 0
+        interval_info = ""
+        if plist_path.is_file():
+            try:
+                with plist_path.open("rb") as f:
+                    pl = plistlib.load(f)
+                cal = pl.get("StartCalendarInterval")
+                if isinstance(cal, list):
+                    ticks = ",".join(
+                        f":{int(item['Minute']):02d}" for item in cal if isinstance(item, dict) and "Minute" in item
+                    )
+                    sched_str = f"hourly at {ticks}" if ticks else "calendar"
+                elif isinstance(cal, dict) and "Minute" in cal:
+                    sched_str = f"hourly at :{int(cal['Minute']):02d}"
+                elif pl.get("StartInterval") is not None:
+                    sched_str = f"every {pl.get('StartInterval')}s"
+                else:
+                    sched_str = "custom"
+                interval_info = f", schedule={sched_str}, RunAtLoad={pl.get('RunAtLoad')}"
+            except Exception:
+                pass
+        print(
+            f"LaunchAgent ({LAUNCHD_LABEL}): {'LOADED' if loaded else 'NOT LOADED'} "
+            f"(plist={'present' if plist_path.is_file() else 'absent'}{interval_info})"
+        )
+    elif sys_name == "Linux":
+        service_path, timer_path = systemd_user_unit_paths()
+        active_state = "UNKNOWN"
+        if shutil.which("systemctl"):
+            proc = _run_scheduler_cmd(["systemctl", "--user", "is-active", f"{SYSTEMD_UNIT_BASE}.timer"])
+            out_s = (proc.stdout or "").strip()
+            active_state = out_s.upper() if out_s else "UNREACHABLE"
+        sched_info = ""
+        if timer_path.is_file():
+            try:
+                sched_str = ""
+                for raw_line in timer_path.read_text(encoding="utf-8", errors="replace").splitlines():
+                    s_line = raw_line.strip()
+                    if s_line.startswith("OnCalendar="):
+                        cal_val = s_line.split("=", 1)[1].strip()
+                        m_cal = re.search(r"\*:([0-9,]+):00$", cal_val)
+                        if m_cal:
+                            ticks = ",".join(f":{int(tok):02d}" for tok in m_cal.group(1).split(",") if tok.isdigit())
+                            sched_str = f"hourly at {ticks}" if ticks else cal_val
+                        else:
+                            sched_str = cal_val
+                        break
+                    if s_line.startswith("OnUnitActiveSec="):
+                        sched_str = f"every {s_line.split('=', 1)[1].strip()}"
+                        break
+                if sched_str:
+                    sched_info = f", schedule={sched_str}"
+            except OSError:
+                pass
+        linger_state = linux_linger_status()
+        print(
+            f"systemd user timer ({SYSTEMD_UNIT_BASE}.timer): {active_state} "
+            f"(timer={'present' if timer_path.is_file() else 'absent'}, "
+            f"service={'present' if service_path.is_file() else 'absent'}"
+            f"{sched_info}, linger={linger_state})"
+        )
+
+    saved_proxy = load_saved_proxy_env(state_dir)
+    if saved_proxy:
+        print(f"Proxy env: {format_proxy_summary(saved_proxy)} (saved)")
+
+    records = read_all_log_records(state_dir)
+    if not records:
+        print("Logs: no runs recorded yet.")
+        return 0
+
+    activations = [r for r in records if record_has_probe(r)]
+    errors = [r for r in records if r.get("status") in ("error", "partial_error")]
+    print(f"Total recorded runs: {len(records)} | Activations: {len(activations)} | Errors: {len(errors)}")
+    if activations:
+        print(f"Last activation: {format_record_line(activations[-1])}")
+    if errors:
+        print(f"Last error:      {format_record_line(errors[-1])}")
+
+    tail_n = max(1, args.lines)
+    print(f"\nRecent {min(tail_n, len(records))} runs:")
+    for r in records[-tail_n:]:
+        print("  " + format_record_line(r))
+    return 0
+
+
+def execute_logs(args: argparse.Namespace) -> int:
+    records = read_all_log_records(default_state_dir())
+    if args.activations:
+        records = [r for r in records if record_has_probe(r)]
+    elif args.errors:
+        records = [r for r in records if r.get("status") in ("error", "partial_error")]
+    tail = records[-max(1, args.lines) :]
+    for r in tail:
+        if args.json:
+            print(json.dumps(r, ensure_ascii=False))
+        else:
+            print(format_record_line(r))
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog=APP_NAME,
+        description="Check Codex subscription weekly quota via zero-cost app-server RPC and wake up freshly reset windows immediately.",
+    )
+    sub = p.add_subparsers(dest="subcommand", required=True)
+
+    p_run = sub.add_parser("run", help="Run a single quota check and wake up an unactivated weekly window")
+    p_run.add_argument("--dry-run", action="store_true", help="Inspect quota without sending a wakeup request")
+    p_run.add_argument(
+        "--force",
+        action="store_true",
+        help="Send minimal wakeup request even if weekly window is already counting down (still respects quota blocks and safety caps)",
+    )
+    p_run.add_argument("--quiet", action="store_true", help="Suppress stdout/stderr JSON output (still writes wakeup.jsonl)")
+    p_run.add_argument("--codex-bin", default=None, help="Explicit path to codex binary")
+    p_run.add_argument("--model", default=None, help="Override wakeup model ID (default: Codex built-in default model)")
+    p_run.add_argument("--effort", default=None, help="Override reasoning effort for wakeup turn (default: low)")
+    p_run.add_argument(
+        "--retry-delays",
+        type=parse_retry_delays_arg,
+        default="5,15",
+        help="Comma-separated retry backoff seconds for quota reads on transient startup/wake network errors (default: 5,15)",
+    )
+
+    p_inst = sub.add_parser("install", help="Install user-level periodic task (macOS LaunchAgent / Linux systemd --user timer)")
+    p_inst.add_argument(
+        "--interval",
+        type=int,
+        default=DEFAULT_INTERVAL_SECONDS,
+        help=f"Check interval in seconds (default: {DEFAULT_INTERVAL_SECONDS}, scheduled at :03 and :33 past each hour)",
+    )
+    p_inst.add_argument(
+        "--minute-offset",
+        type=int,
+        default=CALENDAR_MINUTE_OFFSET,
+        help=f"Minute offset within the hour for hourly-aligned schedules, 0-59 (default: {CALENDAR_MINUTE_OFFSET}; e.g. 18 -> :18,:48 for 30m)",
+    )
+    p_inst.add_argument("--codex-bin", default=None, help="Explicit path to codex binary to persist in scheduled job")
+    p_inst.add_argument("--model", default=None, help="Optional fixed model ID to persist in scheduled job")
+    p_inst.add_argument(
+        "--no-proxy",
+        action="store_true",
+        help="Do not inherit shell proxy env vars and clear any saved upstream proxy config (preserves custom CA vars)",
+    )
+
+    sub.add_parser("uninstall", help="Unload and remove user-level periodic task")
+
+    p_stat = sub.add_parser("status", help="Show scheduler state and recent log summary")
+    p_stat.add_argument("-n", "--lines", type=int, default=10, help="Number of recent log entries to show (default: 10)")
+
+    p_logs = sub.add_parser("logs", help="View or filter recorded runs")
+    p_logs.add_argument("-n", "--lines", type=int, default=30, help="Number of matching entries to print (default: 30)")
+    log_filter = p_logs.add_mutually_exclusive_group()
+    log_filter.add_argument("--activations", action="store_true", help="Show only runs that sent a wakeup request")
+    log_filter.add_argument("--errors", action="store_true", help="Show only runs with errors")
+    p_logs.add_argument("--json", action="store_true", help="Output raw JSONL lines")
+
+    return p
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    raw_args = list(sys.argv[1:] if argv is None else argv)
+    if not raw_args or (raw_args[0].startswith("-") and raw_args[0] not in ("-h", "--help")):
+        raw_args = ["run", *raw_args]
+    parser = build_parser()
+    args = parser.parse_args(raw_args)
+    if args.subcommand == "run":
+        return execute_run(args)
+    if args.subcommand == "install":
+        return execute_install(args)
+    if args.subcommand == "uninstall":
+        return execute_uninstall(args)
+    if args.subcommand == "status":
+        return execute_status(args)
+    if args.subcommand == "logs":
+        return execute_logs(args)
+    parser.print_help()
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

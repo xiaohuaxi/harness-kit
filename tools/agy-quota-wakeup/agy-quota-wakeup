@@ -1,0 +1,1968 @@
+#!/usr/bin/env python3
+"""AGY weekly quota reset detector and minimal chat-only wakeup tool.
+
+Checks `agy --output-format json -p=/usage` (zero token usage, no conversation
+created). Only when a weekly quota bucket (`gemini-weekly` or `3p-weekly`) is
+sitting at 100% unactivated (its 7-day reset clock has not started ticking yet)
+does it send a single minimal chat-only prompt (`tools: []`, no rules/skills/MCP,
+no permission-skipping or OS sandbox flags) from an empty temporary directory to
+wake up the 7-day countdown immediately. If a future AGY CLI release changes
+custom-agent frontmatter or optional flags, it automatically falls back to a
+plain non-yolo `agy --model ... -p=...` request.
+
+Compatible with Python 3.8+ (macOS & Linux including Ubuntu 22.04 / WSL2).
+"""
+
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import fcntl
+import json
+import math
+import os
+import platform
+import plistlib
+import pwd
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
+
+APP_NAME = "agy-quota-wakeup"
+LAUNCHD_LABEL = f"local.{APP_NAME}"
+SYSTEMD_UNIT_BASE = APP_NAME
+DEFAULT_INTERVAL_SECONDS = 1800  # 30m -> runs at :03 and :33 past every hour
+CALENDAR_MINUTE_OFFSET = 3
+MAX_LOG_BYTES = 2 * 1024 * 1024  # 2 MiB per log file, keep 1 rotated backup
+WEEK_SECONDS = 7 * 86400
+COUNTDOWN_GRACE_SECONDS = 300  # reset_time < now + 7d - 5m => clock is already running
+UNVERIFIED_COOLDOWN_SECONDS = 7200  # avoid hourly retry loop if a wakeup failed to lock timer
+JUST_ACTIVATED_WINDOW_SECONDS = 600
+CLOCK_BACKWARD_TOLERANCE_SECONDS = 300  # tolerate minor NTP / WSL2 resume clock rollbacks
+
+STRIP_ENV_EXACT = {
+    "GEMINI_API_KEY",
+    "GOOGLE_API_KEY",
+    "ANTHROPIC_API_KEY",
+    "OPENAI_API_KEY",
+}
+STRIP_ENV_PREFIXES = ("AGY_LLM_GATEWAY_",)
+UPSTREAM_PROXY_KEYS = ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy")
+NO_PROXY_KEYS = ("NO_PROXY", "no_proxy")
+PROXY_ENV_KEYS = UPSTREAM_PROXY_KEYS + NO_PROXY_KEYS
+PROXY_CONFIG_FILENAME = "proxy.json"
+
+MIN_AGY_VERSION = (1, 5, 8)
+VERSION_TRIPLE_RE = re.compile(r"\b(\d+)\.(\d+)\.(\d+)\b")
+FALLBACK_CLI_PHRASES = (
+    "flags provided but not defined",
+    "flag provided but not defined",
+    "unknown flag",
+    "unknown shorthand flag",
+    "unrecognized option",
+    "unknown option",
+    "for flag -",
+    "frontmatter",
+    "yaml:",
+    "cannot unmarshal",
+    "excludedefaultcomponents",
+    "inheritcustomizations",
+    "disable-slash-commands",
+)
+AGENT_LOAD_ERROR_HINTS = (
+    "not found",
+    "no agent",
+    "unknown agent",
+    "invalid agent",
+    "matches no agent",
+    "failed to load",
+    "failed to parse",
+)
+NON_FALLBACK_RUNTIME_TOKENS = (
+    "agy_error:",
+    "rpc error:",
+    "connection",
+    "timeout",
+    "timed out",
+    "deadline",
+    "eof",
+    "network",
+    "proxy",
+    "tls",
+    "certificate",
+    "quota",
+    "rate limit",
+    "unauthorized",
+    "unauthenticated",
+    "permission denied",
+    "internal server error",
+)
+EFFORT_SUFFIX_RE = re.compile(r"-(low|medium|high|xhigh|max)$", re.IGNORECASE)
+EFFORT_RANK = {
+    "low": 0,
+    "": 1,
+    "medium": 2,
+    "high": 3,
+    "xhigh": 4,
+    "max": 5,
+}
+TZ_COMPACT_RE = re.compile(r"([+-]\d{2})(\d{2})$")
+FRAC_SECONDS_RE = re.compile(r"\.(\d+)(?=[+-]\d{2}:\d{2}$|$)")
+
+CHAT_ONLY_AGENT_NAME = "quota-wakeup"
+CHAT_ONLY_AGENT_MD = (
+    "---\n"
+    f"name: {CHAT_ONLY_AGENT_NAME}\n"
+    'description: "Minimal chat-only quota wakeup config."\n'
+    "inheritCustomizations: false\n"
+    "excludeDefaultComponents: true\n"
+    "subagent: false\n"
+    "tools: []\n"
+    "---\n"
+    "Reply with OK.\n"
+)
+WAKEUP_PROMPT_CHAT_ONLY = "OK"
+WAKEUP_PROMPT_FALLBACK = "Reply with the single word OK and do not call any tools."
+
+
+def now_local() -> dt.datetime:
+    return dt.datetime.now().astimezone()
+
+
+def fmt_iso(ts: dt.datetime) -> str:
+    return ts.isoformat(timespec="seconds")
+
+
+def parse_iso_utc(raw: Optional[str]) -> Optional[dt.datetime]:
+    """Parse RFC3339 / ISO-8601 timestamps across Python 3.8+ (including Go nano precision)."""
+    if not raw or not isinstance(raw, str):
+        return None
+    s = raw.strip()
+    if s.endswith(("Z", "z")):
+        s = s[:-1] + "+00:00"
+    else:
+        s = TZ_COMPACT_RE.sub(r"\1:\2", s)
+    # Python <3.11 (e.g. Ubuntu 22.04's Python 3.10) only accepts 0, 3, or 6 fractional digits.
+    s = FRAC_SECONDS_RE.sub(lambda m: "." + m.group(1)[:6].ljust(6, "0"), s)
+    try:
+        parsed = dt.datetime.fromisoformat(s)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=dt.timezone.utc)
+    return parsed.astimezone(dt.timezone.utc)
+
+
+def custom_state_dir_override() -> Optional[Path]:
+    override = (os.environ.get("AGY_QUOTA_WAKEUP_STATE_DIR") or "").strip()
+    if override:
+        return Path(os.path.abspath(os.path.expanduser(override)))
+    return None
+
+
+def default_state_dir() -> Path:
+    override = custom_state_dir_override()
+    if override is not None:
+        return override
+    return Path.home() / ".local" / "state" / APP_NAME
+
+
+def proxy_config_path(state_dir: Path) -> Path:
+    return state_dir / PROXY_CONFIG_FILENAME
+
+
+def has_upstream_proxy(environ: Mapping[str, str]) -> bool:
+    return any((environ.get(k) or "").strip() for k in UPSTREAM_PROXY_KEYS)
+
+
+def capture_proxy_env(environ: Mapping[str, str]) -> Dict[str, str]:
+    """Capture non-empty proxy env vars and bridge ALL_PROXY for Go's net/http."""
+    if not has_upstream_proxy(environ):
+        return {}
+    captured: Dict[str, str] = {}
+    for k in PROXY_ENV_KEYS:
+        val = (environ.get(k) or "").strip()
+        if val:
+            captured[k] = val
+
+    # `agy` (Go net/http.ProxyFromEnvironment) honors HTTP(S)_PROXY/NO_PROXY (both cases)
+    # including socks5:// URLs, but ignores ALL_PROXY/all_proxy.
+    if not (captured.get("HTTPS_PROXY") or captured.get("https_proxy")):
+        if captured.get("ALL_PROXY"):
+            captured["HTTPS_PROXY"] = captured["ALL_PROXY"]
+        elif captured.get("all_proxy"):
+            captured["https_proxy"] = captured["all_proxy"]
+    if not (captured.get("HTTP_PROXY") or captured.get("http_proxy")):
+        if captured.get("ALL_PROXY"):
+            captured["HTTP_PROXY"] = captured["ALL_PROXY"]
+        elif captured.get("all_proxy"):
+            captured["http_proxy"] = captured["all_proxy"]
+    return captured
+
+
+def load_saved_proxy_env(state_dir: Path) -> Dict[str, str]:
+    raw = load_json_dict(proxy_config_path(state_dir)).get("env")
+    if not isinstance(raw, dict):
+        return {}
+    clean = {str(k): str(v).strip() for k, v in raw.items() if k in PROXY_ENV_KEYS and str(v).strip()}
+    return capture_proxy_env(clean)
+
+
+def redact_proxy_value(val: str) -> str:
+    if "://" in val:
+        scheme, rest = val.split("://", 1)
+        if "@" in rest:
+            return f"{scheme}://***@{rest.rsplit('@', 1)[1]}"
+        return val
+    if "@" in val:
+        return f"***@{val.rsplit('@', 1)[1]}"
+    return val
+
+
+def format_proxy_summary(proxy_env: Mapping[str, str]) -> str:
+    return ", ".join(f"{k}={redact_proxy_value(v)}" for k, v in proxy_env.items())
+
+
+def build_clean_env(state_dir: Optional[Path] = None) -> Dict[str, str]:
+    env: Dict[str, str] = {}
+    for k, v in os.environ.items():
+        if k in STRIP_ENV_EXACT:
+            continue
+        if any(k.startswith(pfx) for pfx in STRIP_ENV_PREFIXES):
+            continue
+        env[k] = v
+
+    if has_upstream_proxy(env):
+        env.update(capture_proxy_env(env))
+    elif state_dir is not None:
+        saved_proxy = load_saved_proxy_env(state_dir)
+        if saved_proxy:
+            ambient_no_proxy = {k: env[k] for k in NO_PROXY_KEYS if (env.get(k) or "").strip()}
+            if ambient_no_proxy:
+                for k in NO_PROXY_KEYS:
+                    saved_proxy.pop(k, None)
+            env.update(saved_proxy)
+            env.update(ambient_no_proxy)
+
+    home = env.get("HOME") or str(Path.home())
+    env["HOME"] = home
+    user_bin_dirs = [
+        str(Path(home) / ".local" / "bin"),
+        str(Path(home) / "bin"),
+    ]
+    system_fallback_dirs = [
+        "/opt/homebrew/bin",
+        "/usr/local/bin",
+        "/usr/bin",
+        "/bin",
+        "/usr/sbin",
+        "/sbin",
+    ]
+    existing = [p for p in env.get("PATH", "").split(":") if os.path.isabs(p)]
+    merged: List[str] = []
+    for p in existing + user_bin_dirs + system_fallback_dirs:
+        if p not in merged:
+            merged.append(p)
+    env["PATH"] = ":".join(merged)
+    env.setdefault("LANG", "en_US.UTF-8")
+    return env
+
+
+def resolve_agy_bin(explicit: Optional[str], env: Dict[str, str]) -> str:
+    if explicit is not None:
+        raw = explicit.strip()
+        if not raw:
+            raise FileNotFoundError("Explicit --agy-bin cannot be empty")
+        if ("/" in raw) or (os.sep in raw) or raw.startswith("~"):
+            candidate = os.path.abspath(os.path.expanduser(raw))
+            if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+                return candidate
+            raise FileNotFoundError(f"Explicit --agy-bin is not an executable file: {explicit!r}")
+        found_explicit = shutil.which(raw, path=env.get("PATH"))
+        if found_explicit:
+            return found_explicit
+        raise FileNotFoundError(f"Could not locate explicit --agy-bin {explicit!r} in PATH")
+    found = shutil.which("agy", path=env.get("PATH"))
+    if found:
+        return found
+    fallback = Path(env["HOME"]) / ".local" / "bin" / "agy"
+    if fallback.is_file() and os.access(fallback, os.X_OK):
+        return str(fallback)
+    raise FileNotFoundError("Could not locate `agy` executable in PATH or ~/.local/bin/agy")
+
+
+def atomic_write_text(path: Path, text: str, mode: int = 0o644) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=str(path.parent))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(tmp_name, mode)
+        os.replace(tmp_name, path)
+    except Exception:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
+
+
+def atomic_write_json(path: Path, data: Any) -> None:
+    content = json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+    atomic_write_text(path, content, mode=0o600)
+
+
+def load_json_dict(path: Path) -> Dict[str, Any]:
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            obj = json.load(f)
+        return obj if isinstance(obj, dict) else {}
+    except FileNotFoundError:
+        return {}
+    except Exception:
+        return {}
+
+
+def append_jsonl_with_rotation(log_path: Path, record: Dict[str, Any], max_bytes: int = MAX_LOG_BYTES) -> None:
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    line = json.dumps(record, ensure_ascii=False) + "\n"
+    encoded = line.encode("utf-8")
+    try:
+        if log_path.exists() and log_path.stat().st_size + len(encoded) > max_bytes:
+            rotated = log_path.with_name(log_path.name + ".1")
+            os.replace(log_path, rotated)
+    except OSError:
+        pass
+    with log_path.open("a", encoding="utf-8") as f:
+        f.write(line)
+
+
+def classify_pool(group_name: str, bucket_id: str) -> str:
+    combined = f"{bucket_id} {group_name}".lower()
+    if "gemini" in combined:
+        return "gemini"
+    if any(tok in combined for tok in ("3p", "claude", "gpt", "third")):
+        return "3p"
+    return bucket_id or group_name or "unknown"
+
+
+def extract_weekly_buckets(usage_payload: Dict[str, Any]) -> List[Dict[str, Any]]:
+    cmd = usage_payload.get("command")
+    if not isinstance(cmd, dict):
+        raise ValueError("Missing `command` object in `agy -p=/usage` JSON output")
+    data = cmd.get("data")
+    if not isinstance(data, dict) or not isinstance(data.get("groups"), list):
+        raise ValueError("Missing `command.data.groups` list in `agy -p=/usage` JSON output")
+
+    results: List[Dict[str, Any]] = []
+    for grp in data["groups"]:
+        if not isinstance(grp, dict):
+            continue
+        gname = str(grp.get("name") or "")
+        buckets = grp.get("buckets")
+        if not isinstance(buckets, list):
+            continue
+        for b in buckets:
+            if not isinstance(b, dict):
+                continue
+            bid = str(b.get("id") or "")
+            window = str(b.get("window") or "").lower()
+            if window != "weekly" and "week" not in bid.lower():
+                continue
+            pool = classify_pool(gname, bid)
+            results.append(
+                {
+                    "pool": pool,
+                    "group_name": gname,
+                    "bucket_id": bid,
+                    "raw": b,
+                }
+            )
+    if not results:
+        raise ValueError("No weekly quota buckets found in `agy -p=/usage` output")
+    return results
+
+
+def evaluate_bucket_activity(
+    bucket: Dict[str, Any],
+    now_utc: dt.datetime,
+    last_pool_state: Optional[Dict[str, Any]] = None,
+) -> Tuple[bool, str, Dict[str, Any]]:
+    """Return (is_active_or_skip, reason, summary_fields).
+
+    `True` means no wakeup request should be sent right now (either the 7-day
+    clock is already active, or a safety cooldown applies). `False` means the
+    weekly bucket is unactivated and should be woken up now.
+    """
+    reset_raw = bucket.get("reset_time")
+    reset_utc = parse_iso_utc(reset_raw)
+    seconds_until_reset: Optional[float] = None
+    if reset_utc is not None:
+        seconds_until_reset = (reset_utc - now_utc).total_seconds()
+
+    desc = str(bucket.get("description") or "").strip()
+    local_reset_str = fmt_iso(reset_utc.astimezone()) if reset_utc else (str(reset_raw or ""))
+
+    rem_raw = bucket.get("remaining_fraction")
+    if rem_raw is None:
+        # `agy` uses proto3 `json:"remaining_fraction,omitempty"`, so an exhausted
+        # 0% weekly bucket omits `remaining_fraction` while keeping reset_time/description.
+        if reset_utc is not None or desc:
+            remaining = 0.0
+        else:
+            raise ValueError(f"Bucket {bucket.get('id')!r} missing `remaining_fraction`")
+    else:
+        remaining = float(rem_raw)
+
+    meta: Dict[str, Any] = {
+        "remaining_fraction": remaining,
+        "remaining_pct": round(remaining * 100.0, 4),
+        "reset_time": local_reset_str,
+        "seconds_until_reset": round(seconds_until_reset, 1) if seconds_until_reset is not None else None,
+    }
+
+    if rem_raw is None:
+        return True, "exhausted_0pct", meta
+
+    if remaining < 1.0:
+        return True, "remaining_below_100pct", meta
+
+    if "you have used" in desc.lower():
+        return True, "usage_reported_in_description", meta
+
+    if reset_utc is None:
+        return True, "missing_reset_time", meta
+
+    if seconds_until_reset is not None and seconds_until_reset < (WEEK_SECONDS - COUNTDOWN_GRACE_SECONDS):
+        return True, "reset_timer_counting_down", meta
+
+    if isinstance(last_pool_state, dict):
+        now_epoch = now_utc.timestamp()
+        last_epoch = last_pool_state.get("last_probe_epoch")
+        locked_reset_utc = parse_iso_utc(last_pool_state.get("locked_reset_time"))
+        verified = last_pool_state.get("verified_active")
+
+        if (
+            isinstance(last_epoch, (int, float))
+            and -CLOCK_BACKWARD_TOLERANCE_SECONDS <= (now_epoch - float(last_epoch)) < JUST_ACTIVATED_WINDOW_SECONDS
+            and reset_utc is not None
+            and locked_reset_utc is not None
+            and abs((reset_utc - locked_reset_utc).total_seconds()) <= 30
+        ):
+            return True, "pinned_reset_time_just_activated", meta
+
+        if (
+            verified is False
+            and isinstance(last_epoch, (int, float))
+            and -CLOCK_BACKWARD_TOLERANCE_SECONDS <= (now_epoch - float(last_epoch)) < UNVERIFIED_COOLDOWN_SECONDS
+        ):
+            return True, "unverified_probe_cooldown", meta
+
+    return False, "unactivated_100pct", meta
+
+
+def parse_models_output(stdout: str) -> List[Tuple[str, str]]:
+    models: List[Tuple[str, str]] = []
+    for raw_line in stdout.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        parts = re.split(r"\t+|\s{2,}", line, maxsplit=1)
+        model_id = parts[0].strip()
+        if not model_id or not re.match(r"^[a-z0-9][a-z0-9._-]*$", model_id, re.IGNORECASE):
+            continue
+        display = parts[1].strip() if len(parts) > 1 else model_id
+        models.append((model_id, display))
+    return models
+
+
+def _model_sort_parts(model_id: str) -> Tuple[int, Tuple[int, ...]]:
+    m = EFFORT_SUFFIX_RE.search(model_id)
+    effort = m.group(1).lower() if m else ""
+    effort_rank = EFFORT_RANK.get(effort, 9)
+    base = model_id[: m.start()] if m else model_id
+    raw_nums = tuple(int(x) for x in re.findall(r"\d+", base))
+    padded = (raw_nums + (0,) * 6)[:6]
+    nums = tuple(-x for x in padded)
+    return effort_rank, nums
+
+
+def pick_wakeup_model(pool: str, models: Sequence[Tuple[str, str]]) -> str:
+    """Pick the most cost-effective current model ID for `pool` (`gemini` or `3p`)."""
+    candidates: List[Tuple[int, int, Tuple[int, ...], str]] = []
+
+    if pool == "gemini":
+        for mid, _disp in models:
+            low = mid.lower()
+            if not low.startswith("gemini-") or "orchestrator" in low:
+                continue
+            tier = 0 if "flash" in low else 1
+            effort_rank, neg_nums = _model_sort_parts(low)
+            candidates.append((tier, effort_rank, neg_nums, mid))
+    elif pool == "3p":
+        for mid, _disp in models:
+            low = mid.lower()
+            if low.startswith("gemini-"):
+                continue
+            if "claude" in low and "sonnet" in low:
+                tier = 0
+            elif "claude" in low and "haiku" in low:
+                tier = 1
+            elif "gpt" in low:
+                tier = 2
+            elif "claude" in low and "opus" in low:
+                tier = 3
+            else:
+                tier = 4
+            effort_rank, neg_nums = _model_sort_parts(low)
+            candidates.append((tier, effort_rank, neg_nums, mid))
+    else:
+        raise ValueError(f"Unsupported pool for automatic model selection: {pool!r}")
+
+    if not candidates:
+        raise RuntimeError(f"No matching models found in `agy models` for pool {pool!r}")
+
+    candidates.sort()
+    return candidates[0][3]
+
+
+def write_chat_only_agent(workspace_dir: Path) -> Path:
+    agent_path = workspace_dir / ".agents" / "agents" / f"{CHAT_ONLY_AGENT_NAME}.md"
+    agent_path.parent.mkdir(parents=True, exist_ok=True)
+    agent_path.write_text(CHAT_ONLY_AGENT_MD, encoding="utf-8")
+    return agent_path
+
+
+def build_wakeup_command(agy_bin: str, model_id: str) -> List[str]:
+    """Primary chat-only (`tools: []`) wakeup command without sandbox or permission-bypass flags."""
+    cmd = [agy_bin, "--agent", CHAT_ONLY_AGENT_NAME, "--model", model_id]
+    m = EFFORT_SUFFIX_RE.search(model_id)
+    suffix = m.group(1).lower() if m else ""
+    if suffix in ("", "low"):
+        cmd += ["--effort", "low"]
+    cmd += [
+        "--disable-slash-commands",
+        "--print-timeout",
+        "60s",
+        "--output-format",
+        "json",
+        f"-p={WAKEUP_PROMPT_CHAT_ONLY}",
+    ]
+    return cmd
+
+
+def build_fallback_wakeup_command(agy_bin: str, model_id: str) -> List[str]:
+    """Minimal standard fallback command using only core flags (no custom agent, no yolo/sandbox)."""
+    return [
+        agy_bin,
+        "--model",
+        model_id,
+        "--print-timeout",
+        "60s",
+        "--output-format",
+        "json",
+        f"-p={WAKEUP_PROMPT_FALLBACK}",
+    ]
+
+
+def _compact_cli_error(raw: str, limit: int = 460) -> str:
+    """Strip trailing CLI `--help` dumps while keeping both leading and trailing diagnostics."""
+    core = re.split(r"\nUsage of \S+:", raw, maxsplit=1)[0].strip()
+    if len(core) <= limit:
+        return core
+    head_len = (limit // 2) + 20
+    tail_len = limit - head_len - 5
+    return f"{core[:head_len]} ... {core[-tail_len:]}"
+
+
+def run_agy_json(
+    cmd: Sequence[str],
+    env: Dict[str, str],
+    timeout_s: int = 75,
+    with_chat_only_agent: bool = False,
+) -> Dict[str, Any]:
+    with tempfile.TemporaryDirectory(prefix=f"{APP_NAME}-") as tmpdir:
+        if with_chat_only_agent:
+            write_chat_only_agent(Path(tmpdir))
+        proc = subprocess.run(
+            list(cmd),
+            cwd=tmpdir,
+            env=env,
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=timeout_s,
+        )
+    stdout = (proc.stdout or "").strip()
+    stderr = (proc.stderr or "").strip()
+    if proc.returncode != 0:
+        if stdout:
+            try:
+                err_payload = json.loads(stdout.splitlines()[-1].strip())
+                if isinstance(err_payload, dict) and err_payload.get("status") not in (None, "SUCCESS"):
+                    raise RuntimeError(
+                        f"agy returned non-SUCCESS status: {err_payload.get('status')!r} ({_compact_cli_error(stderr or stdout, 240)})"
+                    )
+            except json.JSONDecodeError:
+                pass
+        detail = _compact_cli_error(stderr or stdout or f"exit code {proc.returncode}")
+        raise RuntimeError(f"agy exited with {proc.returncode}: {detail}")
+    if not stdout:
+        raise RuntimeError("agy returned empty stdout")
+    last_line = stdout.splitlines()[-1].strip()
+    try:
+        payload = json.loads(last_line)
+    except json.JSONDecodeError:
+        payload = json.loads(stdout)
+    if not isinstance(payload, dict):
+        raise RuntimeError("agy JSON output is not an object")
+    if payload.get("status") not in (None, "SUCCESS"):
+        raise RuntimeError(f"agy returned non-SUCCESS status: {payload.get('status')!r}")
+    return payload
+
+
+def ensure_min_agy_version(agy_bin: str, env: Dict[str, str]) -> None:
+    """Require `agy` >= 1.3.4 (zero-cost `/usage` + headless `.agents/agents/` + strict `--agent`)."""
+    min_str = ".".join(str(x) for x in MIN_AGY_VERSION)
+    try:
+        proc = subprocess.run(
+            [agy_bin, "--version"],
+            env=env,
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except Exception as exc:
+        raise RuntimeError(f"Failed to verify `agy --version` (need >= {min_str}): {exc}") from exc
+    combined = f"{proc.stdout or ''} {proc.stderr or ''}".strip()
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"`agy --version` exited with {proc.returncode} (need >= {min_str}): {combined[-200:]}"
+        )
+    m = VERSION_TRIPLE_RE.search(combined)
+    if not m:
+        raise RuntimeError(
+            f"Could not parse version from `agy --version` output {combined[:120]!r} (need >= {min_str})."
+        )
+    ver = (int(m.group(1)), int(m.group(2)), int(m.group(3)))
+    if ver < MIN_AGY_VERSION:
+        found_str = ".".join(str(x) for x in ver)
+        raise RuntimeError(
+            f"`agy` >= {min_str} is required for safe zero-tool wakeup (found {found_str}); run `agy update`."
+        )
+
+
+def _should_fallback_to_standard(exc: Exception) -> bool:
+    """Only fall back when `agy` rejected custom-agent / CLI flags before running a turn."""
+    if isinstance(exc, (subprocess.TimeoutExpired, json.JSONDecodeError)):
+        return False
+    msg = str(exc)
+    if msg.startswith(
+        (
+            "agy returned empty stdout",
+            "agy JSON output is not an object",
+            "agy returned non-SUCCESS status:",
+        )
+    ):
+        return False
+    low = msg.lower()
+    first_line = low.splitlines()[0] if low else ""
+    first_scrubbed = first_line.replace(APP_NAME, "<app>").replace(CHAT_ONLY_AGENT_NAME, "<agent>")
+    # Unambiguous pre-turn CLI flag or custom-agent lookup rejection on the first line
+    # wins immediately even if subsequent lines list available agents named e.g. "proxy-helper".
+    if "rpc error:" not in first_scrubbed:
+        if any(phrase in first_scrubbed for phrase in FALLBACK_CLI_PHRASES):
+            return True
+        if CHAT_ONLY_AGENT_NAME in first_line and any(h in first_scrubbed for h in AGENT_LOAD_ERROR_HINTS):
+            return True
+
+    # Strip our own app/agent identifiers first so "quota" inside "quota-wakeup"
+    # or "/tmp/agy-quota-wakeup-..." never trips the runtime "quota" guard.
+    scrubbed = low.replace(APP_NAME, "<app>").replace(CHAT_ONLY_AGENT_NAME, "<agent>")
+    if any(tok in scrubbed for tok in NON_FALLBACK_RUNTIME_TOKENS):
+        return False
+    if any(phrase in scrubbed for phrase in FALLBACK_CLI_PHRASES):
+        return True
+    if CHAT_ONLY_AGENT_NAME in low and any(h in scrubbed for h in AGENT_LOAD_ERROR_HINTS):
+        return True
+    return False
+
+
+def send_wakeup_request(
+    agy_bin: str,
+    model_id: str,
+    env: Dict[str, str],
+    runner: Any = run_agy_json,
+) -> Tuple[Dict[str, Any], str, Optional[str]]:
+    """Try lightweight chat-only wakeup first; fall back to plain standard mode on CLI flag/agent rejection."""
+    primary_cmd = build_wakeup_command(agy_bin, model_id)
+    try:
+        res = runner(primary_cmd, env=env, timeout_s=90, with_chat_only_agent=True)
+        return res, "chat_only", None
+    except Exception as primary_exc:
+        if not _should_fallback_to_standard(primary_exc):
+            raise
+        fallback_cmd = build_fallback_wakeup_command(agy_bin, model_id)
+        try:
+            res = runner(fallback_cmd, env=env, timeout_s=90, with_chat_only_agent=False)
+            return res, "standard_fallback", str(primary_exc)
+        except Exception as fallback_exc:
+            raise RuntimeError(
+                f"chat-only failed ({primary_exc}); standard fallback also failed ({fallback_exc})"
+            ) from fallback_exc
+
+
+def fetch_usage_with_retries(
+    agy_bin: str,
+    env: Dict[str, str],
+    retry_delays: Sequence[float],
+    attempts_sink: Optional[List[int]] = None,
+) -> Tuple[Dict[str, Any], int]:
+    cmd = [
+        agy_bin,
+        "--settings",
+        '{"disableSlashCommands":false}',
+        "--output-format",
+        "json",
+        "--print-timeout",
+        "45s",
+        "-p=/usage",
+    ]
+    attempts = 0
+    last_err: Optional[Exception] = None
+    for idx in range(len(retry_delays) + 1):
+        attempts += 1
+        if attempts_sink is not None:
+            attempts_sink[:] = [attempts]
+        try:
+            return run_agy_json(cmd, env=env, timeout_s=60), attempts
+        except Exception as exc:
+            last_err = exc
+            if idx < len(retry_delays) and retry_delays[idx] > 0:
+                time.sleep(retry_delays[idx])
+    assert last_err is not None
+    raise last_err
+
+
+def fetch_available_models(agy_bin: str, env: Dict[str, str]) -> List[Tuple[str, str]]:
+    with tempfile.TemporaryDirectory(prefix=f"{APP_NAME}-models-") as tmpdir:
+        proc = subprocess.run(
+            [agy_bin, "models"],
+            cwd=tmpdir,
+            env=env,
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=45,
+        )
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout or "").strip()
+        raise RuntimeError(f"`agy models` failed ({proc.returncode}): {detail[:300]}")
+    models = parse_models_output(proc.stdout or "")
+    if not models:
+        raise RuntimeError("`agy models` returned no parseable models")
+    return models
+
+
+def parse_retry_delays_arg(raw: str) -> List[float]:
+    if not raw or not raw.strip():
+        return []
+    delays: List[float] = []
+    for part in raw.split(","):
+        s = part.strip()
+        if not s:
+            continue
+        try:
+            val = float(s)
+        except ValueError as exc:
+            raise argparse.ArgumentTypeError(f"invalid delay {s!r} in --retry-delays (expected seconds)") from exc
+        if not math.isfinite(val) or val < 0:
+            raise argparse.ArgumentTypeError(f"delay must be a non-negative finite number, got {s!r}")
+        delays.append(val)
+    return delays
+
+
+def selected_pool_set(pools_arg: str) -> Tuple[str, ...]:
+    val = pools_arg.strip().lower()
+    if val == "all":
+        return ("gemini", "3p")
+    if val in ("gemini", "3p"):
+        return (val,)
+    raise ValueError(f"Invalid --pools value: {pools_arg!r} (expected all, gemini, or 3p)")
+
+
+def execute_run(args: argparse.Namespace) -> int:
+    start_mono = time.monotonic()
+    started_at = now_local()
+    state_dir = default_state_dir()
+    state_dir.mkdir(parents=True, exist_ok=True)
+    lock_path = state_dir / "wakeup.lock"
+    state_path = state_dir / "state.json"
+    log_path = state_dir / "wakeup.jsonl"
+
+    lock_fh = lock_path.open("a+", encoding="utf-8")
+    try:
+        try:
+            fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            rec = {
+                "ts": fmt_iso(started_at),
+                "status": "skipped_locked",
+                "duration_ms": int((time.monotonic() - start_mono) * 1000),
+                "error": f"Another {APP_NAME} instance is currently holding wakeup.lock",
+            }
+            if not args.quiet:
+                print(json.dumps(rec, ensure_ascii=False))
+            return 0
+
+        target_pools = selected_pool_set(args.pools)
+        retry_delays = list(args.retry_delays) if isinstance(args.retry_delays, list) else parse_retry_delays_arg(str(args.retry_delays or ""))
+        env = build_clean_env(state_dir=state_dir)
+        state = load_json_dict(state_path)
+        pool_states = state.setdefault("pools", {})
+
+        attempts_box: List[int] = [0]
+        pools_report: Dict[str, Any] = {}
+        try:
+            agy_bin = resolve_agy_bin(args.agy_bin, env)
+            ensure_min_agy_version(agy_bin, env)
+            usage_payload, attempts = fetch_usage_with_retries(
+                agy_bin, env=env, retry_delays=retry_delays, attempts_sink=attempts_box
+            )
+            weekly_buckets = extract_weekly_buckets(usage_payload)
+        except Exception as exc:
+            rec = {
+                "ts": fmt_iso(started_at),
+                "status": "error",
+                "stage": "check_usage",
+                "attempts": attempts_box[0],
+                "duration_ms": int((time.monotonic() - start_mono) * 1000),
+                "error": str(exc),
+            }
+            if not args.dry_run:
+                append_jsonl_with_rotation(log_path, rec)
+            if not args.quiet:
+                print(json.dumps(rec, ensure_ascii=False), file=sys.stderr)
+            return 1
+
+        check_utc = dt.datetime.now(dt.timezone.utc)
+        to_activate: List[Dict[str, Any]] = []
+        probe_errors: List[str] = []
+
+        for item in weekly_buckets:
+            pool = item["pool"]
+            bid = item["bucket_id"]
+            raw_b = item["raw"]
+            if pool not in target_pools:
+                try:
+                    active, reason, meta = evaluate_bucket_activity(raw_b, check_utc, pool_states.get(pool))
+                    pools_report[pool] = {
+                        "bucket_id": bid,
+                        "active_before": active,
+                        "reason": reason,
+                        **meta,
+                        "action": "ignored_by_filter",
+                    }
+                except Exception:
+                    pools_report[pool] = {"bucket_id": bid, "action": "ignored_by_filter"}
+                continue
+
+            try:
+                active, reason, meta = evaluate_bucket_activity(raw_b, check_utc, pool_states.get(pool))
+            except Exception as exc:
+                probe_errors.append(f"{pool}: invalid bucket payload: {exc}")
+                pools_report[pool] = {"bucket_id": bid, "action": "error", "error": str(exc)}
+                continue
+
+            entry: Dict[str, Any] = {
+                "bucket_id": bid,
+                "active_before": active,
+                "reason": reason,
+                **meta,
+                "action": "none",
+            }
+            if args.force and pool in target_pools:
+                active = False
+                entry["reason"] = "forced"
+            pools_report[pool] = entry
+            if not active:
+                to_activate.append(item)
+
+        if len(target_pools) == 1 and target_pools[0] not in pools_report:
+            missing_pool = target_pools[0]
+            probe_errors.append(f"{missing_pool}: target weekly pool not present in `agy -p=/usage` output")
+
+        # Before waking any 100% candidate pool, re-check free `/usage` once after ~2s to
+        # verify `reset_time` is genuinely drifting forward rather than already locked
+        # (protects against sending an extra prompt right after a user's manual request,
+        # regardless of small clock skew between this host and Google's servers).
+        if to_activate and not args.force:
+            time.sleep(2.2)
+            still_to_activate: List[Dict[str, Any]] = []
+            try:
+                drift_payload, extra_att = fetch_usage_with_retries(agy_bin, env=env, retry_delays=[])
+                attempts += extra_att
+                drift_map = {x["pool"]: x["raw"] for x in extract_weekly_buckets(drift_payload)}
+                drift_utc = dt.datetime.now(dt.timezone.utc)
+                for item in to_activate:
+                    pool = item["pool"]
+                    b2 = drift_map.get(pool)
+                    if not b2:
+                        probe_errors.append(f"{pool}: missing bucket during pre-wakeup drift confirmation")
+                        pools_report[pool]["action"] = "error"
+                        continue
+                    act2, rsn2, meta2 = evaluate_bucket_activity(b2, drift_utc, pool_states.get(pool))
+                    t1 = parse_iso_utc(item["raw"].get("reset_time"))
+                    t2 = parse_iso_utc(b2.get("reset_time"))
+                    if act2 or (t1 is not None and t2 is not None and t2 <= t1):
+                        pools_report[pool].update(
+                            {
+                                "active_before": True,
+                                "reason": rsn2 if act2 else "reset_time_already_locked",
+                                **meta2,
+                            }
+                        )
+                    else:
+                        item["raw"] = b2
+                        pools_report[pool].update(meta2)
+                        still_to_activate.append(item)
+                to_activate = still_to_activate
+            except Exception as exc:
+                probe_errors.append(f"pre-wakeup drift confirmation failed: {exc}")
+                to_activate = []
+
+        if not to_activate and not probe_errors:
+            rec = {
+                "ts": fmt_iso(started_at),
+                "status": "dry_run" if args.dry_run else "ok",
+                "attempts": attempts,
+                "duration_ms": int((time.monotonic() - start_mono) * 1000),
+                "pools": pools_report,
+                "error": None,
+            }
+            if not args.dry_run:
+                append_jsonl_with_rotation(log_path, rec)
+            if not args.quiet:
+                print(json.dumps(rec, ensure_ascii=False))
+            return 0
+
+        models_cache: Optional[List[Tuple[str, str]]] = None
+        sent_any_probe = False
+
+        for item in to_activate:
+            pool = item["pool"]
+            entry = pools_report[pool]
+            explicit_model = args.gemini_model if pool == "gemini" else (args.third_party_model if pool == "3p" else None)
+            try:
+                if explicit_model:
+                    model_id = explicit_model
+                else:
+                    if models_cache is None:
+                        models_cache = fetch_available_models(agy_bin, env=env)
+                    model_id = pick_wakeup_model(pool, models_cache)
+            except Exception as exc:
+                err_msg = f"{pool}: model selection failed: {exc}"
+                probe_errors.append(err_msg)
+                entry["action"] = "error"
+                entry["error"] = str(exc)
+                continue
+
+            if args.dry_run:
+                entry["action"] = "dry_run_would_wake"
+                entry["selected_model"] = model_id
+                continue
+
+            try:
+                probe_res, wake_mode, primary_err = send_wakeup_request(agy_bin, model_id, env=env)
+                usage_obj = probe_res.get("usage") if isinstance(probe_res.get("usage"), dict) else {}
+                probe_info: Dict[str, Any] = {
+                    "ok": True,
+                    "mode": wake_mode,
+                    "model": model_id,
+                    "conversation_id": probe_res.get("conversation_id"),
+                    "duration_s": round(float(probe_res.get("duration_seconds") or 0.0), 3),
+                    "total_tokens": usage_obj.get("total_tokens"),
+                    "response": str(probe_res.get("response") or "").strip()[:80],
+                }
+                if primary_err:
+                    probe_info["primary_error"] = primary_err
+                entry["action"] = "probed"
+                entry["probe"] = probe_info
+                sent_any_probe = True
+                # Persist immediately so the 2h unverified cooldown protects against
+                # repeat probes even if the subsequent `/usage` recheck fails or is interrupted.
+                pool_states[pool] = {
+                    "last_probe_epoch": time.time(),
+                    "last_probe_ts": fmt_iso(now_local()),
+                    "model": model_id,
+                    "verified_active": False,
+                    "locked_reset_time": None,
+                    "remaining_fraction_after": None,
+                }
+                atomic_write_json(state_path, state)
+            except Exception as exc:
+                err_msg = f"{pool} ({model_id}): wakeup failed: {exc}"
+                probe_errors.append(err_msg)
+                entry["action"] = "probe_failed"
+                entry["probe"] = {
+                    "ok": False,
+                    "model": model_id,
+                    "error": str(exc),
+                }
+
+        # Re-check `/usage` right after waking up to confirm the 7-day reset clock locked in.
+        if sent_any_probe and not args.dry_run:
+            time.sleep(1.0)
+            recheck_epoch = time.time()
+            try:
+                after_payload, _ = fetch_usage_with_retries(agy_bin, env=env, retry_delays=[3.0])
+                after_buckets = {x["pool"]: x["raw"] for x in extract_weekly_buckets(after_payload)}
+                after_utc = dt.datetime.now(dt.timezone.utc)
+                needs_pin_recheck: List[str] = []
+
+                for item in to_activate:
+                    pool = item["pool"]
+                    entry = pools_report[pool]
+                    if entry.get("action") != "probed":
+                        continue
+                    after_b = after_buckets.get(pool)
+                    if not after_b:
+                        continue
+                    active_after, reason_after, meta_after = evaluate_bucket_activity(after_b, after_utc, None)
+                    if reason_after == "missing_reset_time":
+                        active_after = False
+                    entry["verified_active_after"] = active_after
+                    entry["reason_after"] = reason_after
+                    entry["remaining_pct_after"] = meta_after["remaining_pct"]
+                    entry["reset_time_after"] = meta_after["reset_time"]
+                    if not active_after:
+                        needs_pin_recheck.append(pool)
+
+                if needs_pin_recheck:
+                    time.sleep(3.0)
+                    second_payload, _ = fetch_usage_with_retries(agy_bin, env=env, retry_delays=[2.0])
+                    second_buckets = {x["pool"]: x["raw"] for x in extract_weekly_buckets(second_payload)}
+                    second_utc = dt.datetime.now(dt.timezone.utc)
+                    for pool in needs_pin_recheck:
+                        first_b = after_buckets.get(pool) or {}
+                        sec_b = second_buckets.get(pool)
+                        if not sec_b:
+                            continue
+                        active2, reason2, meta2 = evaluate_bucket_activity(sec_b, second_utc, None)
+                        if reason2 == "missing_reset_time":
+                            active2 = False
+                        t1 = parse_iso_utc(first_b.get("reset_time"))
+                        t2 = parse_iso_utc(sec_b.get("reset_time"))
+                        if (
+                            not active2
+                            and t1 is not None
+                            and t2 is not None
+                            and t2 > second_utc
+                            and abs((t2 - t1).total_seconds()) <= 1.0
+                        ):
+                            active2 = True
+                            reason2 = "reset_time_locked"
+                        after_buckets[pool] = sec_b
+                        entry = pools_report[pool]
+                        entry["verified_active_after"] = active2
+                        entry["reason_after"] = reason2
+                        entry["remaining_pct_after"] = meta2["remaining_pct"]
+                        entry["reset_time_after"] = meta2["reset_time"]
+
+                for item in to_activate:
+                    pool = item["pool"]
+                    entry = pools_report[pool]
+                    if entry.get("action") != "probed":
+                        continue
+                    after_b = after_buckets.get(pool)
+                    if not after_b:
+                        probe_errors.append(f"{pool}: missing weekly bucket in post-wakeup /usage recheck")
+                        continue
+                    verified_now = bool(entry.get("verified_active_after"))
+                    pool_states[pool] = {
+                        "last_probe_epoch": recheck_epoch,
+                        "last_probe_ts": fmt_iso(now_local()),
+                        "model": entry["probe"]["model"],
+                        "verified_active": verified_now,
+                        "locked_reset_time": after_b.get("reset_time"),
+                        "remaining_fraction_after": after_b.get("remaining_fraction"),
+                    }
+                    if not verified_now:
+                        probe_errors.append(f"{pool}: wakeup request sent ({entry['probe']['model']}) but 7-day timer did not lock")
+                atomic_write_json(state_path, state)
+            except Exception as exc:
+                probe_errors.append(f"post-wakeup usage recheck failed: {exc}")
+
+        if probe_errors and sent_any_probe:
+            overall_status = "partial_error"
+        elif probe_errors:
+            overall_status = "error"
+        elif args.dry_run:
+            overall_status = "dry_run"
+        else:
+            overall_status = "activated"
+
+        rec = {
+            "ts": fmt_iso(started_at),
+            "status": overall_status,
+            "attempts": attempts,
+            "duration_ms": int((time.monotonic() - start_mono) * 1000),
+            "pools": pools_report,
+            "error": "; ".join(probe_errors) if probe_errors else None,
+        }
+        if not args.dry_run:
+            append_jsonl_with_rotation(log_path, rec)
+        if not args.quiet:
+            stream = sys.stderr if overall_status in ("error", "partial_error") else sys.stdout
+            print(json.dumps(rec, ensure_ascii=False), file=stream)
+        return 1 if overall_status in ("error", "partial_error") else 0
+    finally:
+        lock_fh.close()
+
+
+# ---------------------------------------------------------------------------
+# OS Scheduler Management (macOS launchd & Linux systemd --user)
+# ---------------------------------------------------------------------------
+
+
+def preferred_self_executable() -> str:
+    self_real = Path(__file__).resolve()
+    linked = Path.home() / ".local" / "bin" / APP_NAME
+    try:
+        if linked.exists() and os.path.samefile(linked, self_real):
+            return str(linked)
+    except OSError:
+        pass
+    return str(self_real)
+
+
+def launchd_plist_path() -> Path:
+    return Path.home() / "Library" / "LaunchAgents" / f"{LAUNCHD_LABEL}.plist"
+
+
+def calendar_minutes_for_interval(interval: int, offset_minute: int = CALENDAR_MINUTE_OFFSET) -> Optional[List[int]]:
+    """Return sorted wall-clock minutes within each hour when `interval` divides 1h cleanly."""
+    if interval <= 0 or interval % 60 != 0:
+        return None
+    step_min = interval // 60
+    if step_min < 1 or step_min > 60 or 60 % step_min != 0:
+        return None
+    start = offset_minute % step_min
+    return [start + k * step_min for k in range(60 // step_min)]
+
+
+def describe_schedule(interval: int, offset_minute: int = CALENDAR_MINUTE_OFFSET) -> str:
+    mins = calendar_minutes_for_interval(interval, offset_minute=offset_minute)
+    if mins:
+        ticks = ",".join(f":{m:02d}" for m in mins)
+        return f"every {interval // 60}m (hourly at {ticks})"
+    return f"every {interval}s"
+
+
+def build_launchd_plist(
+    interval: int,
+    pools: str,
+    state_dir: Path,
+    agy_bin: Optional[str] = None,
+    custom_state_dir: Optional[Path] = None,
+    offset_minute: int = CALENDAR_MINUTE_OFFSET,
+) -> Dict[str, Any]:
+    env = build_clean_env()
+    prog_args = [
+        preferred_self_executable(),
+        "run",
+        "--quiet",
+        "--pools",
+        pools,
+    ]
+    if agy_bin:
+        prog_args += ["--agy-bin", agy_bin]
+    env_vars: Dict[str, str] = {
+        "HOME": env["HOME"],
+        "PATH": env["PATH"],
+        "LANG": env["LANG"],
+    }
+    effective_custom_state = custom_state_dir if custom_state_dir is not None else custom_state_dir_override()
+    if effective_custom_state is not None:
+        env_vars["AGY_QUOTA_WAKEUP_STATE_DIR"] = str(effective_custom_state)
+    plist: Dict[str, Any] = {
+        "Label": LAUNCHD_LABEL,
+        "ProcessType": "Background",
+        "ProgramArguments": prog_args,
+        "RunAtLoad": True,
+        "EnvironmentVariables": env_vars,
+        "StandardErrorPath": str(state_dir / "launchd-stderr.log"),
+    }
+    mins = calendar_minutes_for_interval(interval, offset_minute=offset_minute)
+    if mins:
+        plist["StartCalendarInterval"] = [{"Minute": m} for m in mins]
+    else:
+        plist["StartInterval"] = int(interval)
+    return plist
+
+
+def systemd_user_unit_paths() -> Tuple[Path, Path]:
+    xdg_cfg = os.environ.get("XDG_CONFIG_HOME")
+    base = Path(xdg_cfg).expanduser() if xdg_cfg else (Path.home() / ".config")
+    unit_dir = base / "systemd" / "user"
+    return (
+        unit_dir / f"{SYSTEMD_UNIT_BASE}.service",
+        unit_dir / f"{SYSTEMD_UNIT_BASE}.timer",
+    )
+
+
+def _systemd_env_assignment(key: str, val: str) -> str:
+    escaped = val.replace("\\", "\\\\").replace('"', '\\"').replace("%", "%%")
+    return f'Environment="{key}={escaped}"'
+
+
+def _systemd_exec_arg(val: str) -> str:
+    spec_safe = val.replace("%", "%%")
+    if re.match(r"^[A-Za-z0-9_./:@+=-]+$", spec_safe):
+        return spec_safe
+    escaped = spec_safe.replace("\\", "\\\\").replace('"', '\\"').replace("$", "$$")
+    return f'"{escaped}"'
+
+
+def build_systemd_units(
+    interval: int,
+    pools: str,
+    agy_bin: Optional[str] = None,
+    custom_state_dir: Optional[Path] = None,
+    offset_minute: int = CALENDAR_MINUTE_OFFSET,
+) -> Tuple[str, str]:
+    env = build_clean_env()
+    exe = _systemd_exec_arg(preferred_self_executable())
+    pools_q = _systemd_exec_arg(pools)
+    extra = f" --agy-bin {_systemd_exec_arg(agy_bin)}" if agy_bin else ""
+    env_lines = [
+        _systemd_env_assignment("HOME", env["HOME"]),
+        _systemd_env_assignment("PATH", env["PATH"]),
+        _systemd_env_assignment("LANG", env["LANG"]),
+    ]
+    effective_custom_state = custom_state_dir if custom_state_dir is not None else custom_state_dir_override()
+    if effective_custom_state is not None:
+        env_lines.append(_systemd_env_assignment("AGY_QUOTA_WAKEUP_STATE_DIR", str(effective_custom_state)))
+    env_block = "\n".join(env_lines)
+    service_text = (
+        "[Unit]\n"
+        "Description=AGY weekly quota reset detector and wakeup tool\n"
+        "After=network-online.target\n\n"
+        "[Service]\n"
+        "Type=oneshot\n"
+        "TimeoutStartSec=960\n"
+        "Nice=19\n"
+        f"{env_block}\n"
+        f"ExecStart={exe} run --quiet --pools {pools_q}{extra}\n"
+    )
+    mins = calendar_minutes_for_interval(interval, offset_minute=offset_minute)
+    if mins:
+        min_spec = ",".join(f"{m:02d}" for m in mins)
+        trigger_line = f"OnCalendar=*-*-* *:{min_spec}:00\n"
+    else:
+        trigger_line = f"OnUnitActiveSec={int(interval)}s\n"
+    timer_text = (
+        "[Unit]\n"
+        "Description=Periodic check to wake up reset AGY weekly quota windows\n\n"
+        "[Timer]\n"
+        "OnStartupSec=45s\n"
+        f"{trigger_line}"
+        "Persistent=true\n\n"
+        "[Install]\n"
+        "WantedBy=timers.target\n"
+    )
+    return service_text, timer_text
+
+
+def current_username() -> str:
+    for key in ("USER", "LOGNAME"):
+        val = (os.environ.get(key) or "").strip()
+        if val:
+            return val
+    try:
+        return pwd.getpwuid(os.getuid()).pw_name
+    except Exception:
+        return str(os.getuid())
+
+
+def linux_linger_status() -> str:
+    """Return 'yes', 'no', or 'unknown' for the current Linux user's systemd linger state."""
+    if shutil.which("loginctl"):
+        try:
+            proc = subprocess.run(
+                ["loginctl", "show-user", str(os.getuid()), "-p", "Linger"],
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            if proc.returncode == 0:
+                out = (proc.stdout or "").strip().lower()
+                if out in ("linger=yes", "yes"):
+                    return "yes"
+                if out in ("linger=no", "no"):
+                    return "no"
+        except Exception:
+            pass
+    linger_marker = Path("/var/lib/systemd/linger") / current_username()
+    try:
+        if linger_marker.exists():
+            return "yes"
+    except OSError:
+        pass
+    return "unknown"
+
+
+def _run_scheduler_cmd(cmd: Sequence[str], timeout_s: float = 15.0) -> subprocess.CompletedProcess:
+    try:
+        return subprocess.run(
+            list(cmd),
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=timeout_s,
+        )
+    except subprocess.TimeoutExpired:
+        return subprocess.CompletedProcess(list(cmd), 124, "", f"command timed out after {timeout_s:.0f}s")
+
+
+def ensure_linux_linger() -> str:
+    """Ensure systemd user timer survives SSH logout on Linux servers; never fail install."""
+    before = linux_linger_status()
+    if before == "yes":
+        return "enabled (timer stays active after SSH logout)"
+    if before == "no" and shutil.which("loginctl"):
+        try:
+            proc = _run_scheduler_cmd(["loginctl", "--no-ask-password", "enable-linger"], timeout_s=10.0)
+            if proc.returncode == 0 or linux_linger_status() == "yes":
+                return "enabled via loginctl (timer stays active after SSH logout)"
+            detail = (proc.stderr or proc.stdout or "").strip() or f"exit code {proc.returncode}"
+        except Exception as exc:
+            detail = str(exc)
+        user = current_username()
+        return f"NOT enabled ({detail}); run `sudo loginctl enable-linger {shlex.quote(user)}` so timer survives SSH logout"
+    return ""
+
+
+def systemd_user_available() -> Tuple[bool, str]:
+    if not shutil.which("systemctl"):
+        return False, "`systemctl` not found"
+    try:
+        proc = _run_scheduler_cmd(["systemctl", "--user", "show-environment"], timeout_s=5.0)
+    except Exception as exc:
+        return False, str(exc)
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout or "").strip()
+        return False, detail or f"exit code {proc.returncode}"
+    return True, ""
+
+
+def _install_macos(
+    interval: int,
+    pools: str,
+    state_dir: Path,
+    agy_bin: Optional[str],
+    disable_proxy: bool = False,
+    offset_minute: int = CALENDAR_MINUTE_OFFSET,
+) -> Tuple[int, Dict[str, str], bool]:
+    domain = f"gui/{os.getuid()}"
+    domain_chk = _run_scheduler_cmd(["launchctl", "print", domain])
+    if domain_chk.returncode != 0:
+        detail = (domain_chk.stderr or domain_chk.stdout or "").strip() or f"exit code {domain_chk.returncode}"
+        print(
+            f"macOS LaunchAgent GUI domain {domain} is unavailable ({detail}).\n"
+            "Log into the macOS graphical desktop session and re-run `install`.",
+            file=sys.stderr,
+        )
+        return 1, {}, False
+
+    saved_proxy, cleared_proxy = persist_install_proxy_env(state_dir, disable_proxy=disable_proxy)
+    plist_path = launchd_plist_path()
+    plist_path.parent.mkdir(parents=True, exist_ok=True)
+    plist_data = build_launchd_plist(interval, pools, state_dir, agy_bin=agy_bin, offset_minute=offset_minute)
+
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{plist_path.name}.", dir=str(plist_path.parent))
+    try:
+        with os.fdopen(fd, "wb") as f:
+            plistlib.dump(plist_data, f, sort_keys=True)
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(tmp_name, 0o644)
+        os.replace(tmp_name, plist_path)
+    except Exception:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
+
+    _run_scheduler_cmd(["launchctl", "bootout", f"{domain}/{LAUNCHD_LABEL}"])
+    _run_scheduler_cmd(["launchctl", "enable", f"{domain}/{LAUNCHD_LABEL}"])
+    boot = None
+    for attempt in range(4):
+        boot = _run_scheduler_cmd(["launchctl", "bootstrap", domain, str(plist_path)])
+        if boot.returncode == 0:
+            break
+        if attempt < 3:
+            time.sleep(0.4)
+    assert boot is not None
+    if boot.returncode != 0:
+        detail = (boot.stderr or boot.stdout or "").strip()
+        print(f"launchctl bootstrap failed ({boot.returncode}): {detail}", file=sys.stderr)
+        return 1, saved_proxy, cleared_proxy
+
+    print(f"Installed and loaded LaunchAgent {LAUNCHD_LABEL}")
+    print(f"  Plist:    {plist_path}")
+    print(f"  Schedule: {describe_schedule(interval, offset_minute=offset_minute)} (and RunAtLoad=true)")
+    print(f"  Pools:    {pools}")
+    print(f"  Log:      {state_dir / 'wakeup.jsonl'}")
+    return 0, saved_proxy, cleared_proxy
+
+
+def _install_linux(
+    interval: int,
+    pools: str,
+    state_dir: Path,
+    agy_bin: Optional[str],
+    resolved_agy_bin: Optional[str] = None,
+    disable_proxy: bool = False,
+    offset_minute: int = CALENDAR_MINUTE_OFFSET,
+) -> Tuple[int, Dict[str, str], bool]:
+    service_path, timer_path = systemd_user_unit_paths()
+    has_existing_units = service_path.exists() or timer_path.exists()
+    ok, reason = systemd_user_available()
+    if not ok:
+        if has_existing_units:
+            print(
+                f"systemd --user is unreachable ({reason}) while {SYSTEMD_UNIT_BASE} units already exist.\n"
+                "Refusing to overwrite runtime proxy state; if you switched users via `su`/`sudo`, log in directly over SSH and retry.",
+                file=sys.stderr,
+            )
+            return 1, {}, False
+        saved_proxy, cleared_proxy = persist_install_proxy_env(state_dir, disable_proxy=disable_proxy)
+        py_exe = shlex.quote(sys.executable)
+        exe = shlex.quote(preferred_self_executable())
+        cron_agy = agy_bin or resolved_agy_bin
+        extra = f" --agy-bin {shlex.quote(cron_agy)}" if cron_agy else ""
+        custom_state = custom_state_dir_override()
+        env_prefix = f"AGY_QUOTA_WAKEUP_STATE_DIR={shlex.quote(str(custom_state))} " if custom_state else ""
+        mins = calendar_minutes_for_interval(interval, offset_minute=offset_minute)
+        fallback_mins = calendar_minutes_for_interval(DEFAULT_INTERVAL_SECONDS, offset_minute=offset_minute) or [3, 33]
+        cron_min = ",".join(str(m) for m in (mins or fallback_mins))
+        cron_note = "" if mins else " (default 30m schedule example; adjust cron fields if needed)"
+        cron_cmd = f"{env_prefix}{py_exe} {exe} run --quiet --pools {shlex.quote(pools)}{extra}".replace("%", "\\%")
+        print(
+            f"systemd --user is not active in this Linux environment ({reason}).\n"
+            "Skipped writing scheduler units to avoid touching system/cron files.\n"
+            "If you switched users via `su`/`sudo`, log in directly via SSH and retry;\n"
+            "otherwise enable systemd (e.g. `[boot] systemd=true` in `/etc/wsl.conf` on WSL2),\n"
+            f"or add a user cron entry manually with `crontab -e`{cron_note}:\n"
+            f"  {cron_min} * * * * {cron_cmd}",
+            file=sys.stderr,
+        )
+        return 1, saved_proxy, cleared_proxy
+
+    saved_proxy, cleared_proxy = persist_install_proxy_env(state_dir, disable_proxy=disable_proxy)
+    service_text, timer_text = build_systemd_units(interval, pools, agy_bin=agy_bin, offset_minute=offset_minute)
+    atomic_write_text(service_path, service_text, mode=0o644)
+    atomic_write_text(timer_path, timer_text, mode=0o644)
+
+    for subcmd in (
+        ["systemctl", "--user", "daemon-reload"],
+        ["systemctl", "--user", "enable", "--now", f"{SYSTEMD_UNIT_BASE}.timer"],
+        ["systemctl", "--user", "start", "--no-block", f"{SYSTEMD_UNIT_BASE}.service"],
+    ):
+        proc = _run_scheduler_cmd(subcmd)
+        if proc.returncode != 0:
+            detail = (proc.stderr or proc.stdout or "").strip()
+            print(f"{' '.join(subcmd)} failed ({proc.returncode}): {detail}", file=sys.stderr)
+            return 1, saved_proxy, cleared_proxy
+
+    linger_note = ensure_linux_linger()
+
+    print(f"Installed and enabled user timer {SYSTEMD_UNIT_BASE}.timer")
+    print(f"  Service:  {service_path}")
+    print(f"  Timer:    {timer_path}")
+    print(f"  Schedule: {describe_schedule(interval, offset_minute=offset_minute)} (Persistent=true)")
+    if linger_note:
+        print(f"  Linger:   {linger_note}")
+    print(f"  Pools:    {pools}")
+    print(f"  Log:      {state_dir / 'wakeup.jsonl'}")
+    return 0, saved_proxy, cleared_proxy
+
+
+def persist_install_proxy_env(state_dir: Path, disable_proxy: bool) -> Tuple[Dict[str, str], bool]:
+    """Save or clear proxy.json (0600) before launching background tasks. Returns (saved_map, cleared_existing)."""
+    pfile = proxy_config_path(state_dir)
+    had_existing = pfile.exists()
+    captured = {} if disable_proxy else capture_proxy_env(os.environ)
+    if captured:
+        atomic_write_json(pfile, {"env": captured})
+        return captured, False
+    if had_existing:
+        try:
+            pfile.unlink()
+            return {}, True
+        except FileNotFoundError:
+            return {}, False
+    return {}, False
+
+
+def execute_install(args: argparse.Namespace) -> int:
+    selected_pool_set(args.pools)
+    if args.interval < 60:
+        print("--interval must be at least 60 seconds.", file=sys.stderr)
+        return 2
+    if not (0 <= args.minute_offset <= 59):
+        print("--minute-offset must be between 0 and 59.", file=sys.stderr)
+        return 2
+
+    state_dir = default_state_dir()
+    clean_env = build_clean_env(state_dir=state_dir)
+    try:
+        resolved_agy = resolve_agy_bin(args.agy_bin, clean_env)
+        ensure_min_agy_version(resolved_agy, clean_env)
+    except FileNotFoundError as exc:
+        print(f"{exc}\nPass `--agy-bin /path/to/agy` if `agy` is installed in a custom location.", file=sys.stderr)
+        return 1
+    except RuntimeError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+
+    self_exe = preferred_self_executable()
+    if not os.access(self_exe, os.X_OK):
+        try:
+            os.chmod(self_exe, os.stat(self_exe).st_mode | 0o111)
+        except OSError:
+            pass
+        if not os.access(self_exe, os.X_OK):
+            print(f"Script is not executable: {self_exe}\nRun: chmod +x {shlex.quote(self_exe)}", file=sys.stderr)
+            return 1
+
+    persisted_agy_bin = resolved_agy if args.agy_bin is not None else None
+    state_dir.mkdir(parents=True, exist_ok=True)
+    disable_proxy = bool(args.no_proxy)
+
+    sys_name = platform.system()
+    if sys_name == "Darwin":
+        rc, saved_proxy, cleared_proxy = _install_macos(
+            args.interval,
+            args.pools,
+            state_dir,
+            agy_bin=persisted_agy_bin,
+            disable_proxy=disable_proxy,
+            offset_minute=args.minute_offset,
+        )
+    elif sys_name == "Linux":
+        rc, saved_proxy, cleared_proxy = _install_linux(
+            args.interval,
+            args.pools,
+            state_dir,
+            agy_bin=persisted_agy_bin,
+            resolved_agy_bin=resolved_agy,
+            disable_proxy=disable_proxy,
+            offset_minute=args.minute_offset,
+        )
+    else:
+        print(f"install is only supported on macOS and Linux (current OS: {sys_name}).", file=sys.stderr)
+        return 2
+
+    if saved_proxy:
+        print(f"  Proxy:    inherited {format_proxy_summary(saved_proxy)} (saved in 0600 {PROXY_CONFIG_FILENAME})")
+    elif cleared_proxy:
+        print(f"  Proxy:    cleared previous {PROXY_CONFIG_FILENAME}")
+    if rc == 0:
+        print(f"  Verify:   run `{APP_NAME} status` in a few seconds to confirm the initial check succeeded")
+    return rc
+
+
+def _remove_saved_proxy_file() -> None:
+    pfile = proxy_config_path(default_state_dir())
+    try:
+        pfile.unlink()
+    except FileNotFoundError:
+        pass
+
+
+def execute_uninstall(_args: argparse.Namespace) -> int:
+    sys_name = platform.system()
+    if sys_name == "Darwin":
+        domain = f"gui/{os.getuid()}"
+        domain_target = f"{domain}/{LAUNCHD_LABEL}"
+        plist_path = launchd_plist_path()
+        bootout = _run_scheduler_cmd(["launchctl", "bootout", domain_target])
+        still_loaded = False
+        for _ in range(3):
+            chk = _run_scheduler_cmd(["launchctl", "print", domain_target])
+            if chk.returncode != 0:
+                still_loaded = False
+                break
+            still_loaded = True
+            time.sleep(0.3)
+        bootout_detail = (bootout.stderr or bootout.stdout or "").strip()
+        benign_absent = any(
+            tok in bootout_detail.lower()
+            for tok in ("no such process", "could not find specified service", "not found")
+        )
+        if still_loaded or (plist_path.exists() and bootout.returncode != 0 and not benign_absent):
+            detail = bootout_detail or f"exit code {bootout.returncode}"
+            print(f"Failed to unload {LAUNCHD_LABEL}: {detail}", file=sys.stderr)
+            return 1
+        if plist_path.exists():
+            plist_path.unlink()
+            print(f"Unloaded and removed {plist_path}")
+        else:
+            print(f"{LAUNCHD_LABEL} was not installed at {plist_path}")
+        _remove_saved_proxy_file()
+        return 0
+
+    if sys_name == "Linux":
+        service_path, timer_path = systemd_user_unit_paths()
+        has_units = timer_path.exists() or service_path.exists()
+        if not shutil.which("systemctl"):
+            if has_units:
+                print(
+                    f"Cannot stop {SYSTEMD_UNIT_BASE}.timer because `systemctl` was not found in PATH.",
+                    file=sys.stderr,
+                )
+                return 1
+        else:
+            ok, reason = systemd_user_available()
+            if not ok and has_units:
+                print(
+                    f"Cannot stop {SYSTEMD_UNIT_BASE}.timer because systemd --user is unreachable ({reason}).",
+                    file=sys.stderr,
+                )
+                return 1
+            if ok:
+                dis = _run_scheduler_cmd(["systemctl", "--user", "disable", "--now", f"{SYSTEMD_UNIT_BASE}.timer"])
+                stp = _run_scheduler_cmd(["systemctl", "--user", "stop", f"{SYSTEMD_UNIT_BASE}.service"])
+                _run_scheduler_cmd(["systemctl", "--user", "reset-failed", f"{SYSTEMD_UNIT_BASE}.service"])
+                show_timer = _run_scheduler_cmd(
+                    [
+                        "systemctl",
+                        "--user",
+                        "show",
+                        "-p",
+                        "LoadState",
+                        "-p",
+                        "ActiveState",
+                        f"{SYSTEMD_UNIT_BASE}.timer",
+                    ]
+                )
+                show_svc = _run_scheduler_cmd(
+                    [
+                        "systemctl",
+                        "--user",
+                        "show",
+                        "-p",
+                        "LoadState",
+                        "-p",
+                        "ActiveState",
+                        f"{SYSTEMD_UNIT_BASE}.service",
+                    ]
+                )
+                t_props = dict(
+                    line.split("=", 1) for line in (show_timer.stdout or "").splitlines() if "=" in line
+                )
+                s_props = dict(
+                    line.split("=", 1) for line in (show_svc.stdout or "").splitlines() if "=" in line
+                )
+                timer_stopped = show_timer.returncode == 0 and (
+                    t_props.get("LoadState") == "not-found"
+                    or t_props.get("ActiveState") in ("inactive", "failed")
+                )
+                svc_stopped = show_svc.returncode == 0 and (
+                    s_props.get("LoadState") == "not-found"
+                    or s_props.get("ActiveState") in ("inactive", "failed")
+                )
+                if not (timer_stopped and svc_stopped):
+                    detail = (
+                        (dis.stderr or stp.stderr or show_timer.stderr or show_svc.stderr or "").strip()
+                        or f"timer={t_props.get('ActiveState', 'unknown')}, service={s_props.get('ActiveState', 'unknown')}"
+                    )
+                    print(f"Failed to stop {SYSTEMD_UNIT_BASE} units: {detail}", file=sys.stderr)
+                    return 1
+        removed = False
+        for p in (timer_path, service_path):
+            if p.exists():
+                p.unlink()
+                removed = True
+        if shutil.which("systemctl"):
+            _run_scheduler_cmd(["systemctl", "--user", "daemon-reload"])
+        _remove_saved_proxy_file()
+        if removed:
+            print(f"Disabled and removed {timer_path} and {service_path}")
+        else:
+            print(f"{SYSTEMD_UNIT_BASE} systemd user units were not installed")
+        return 0
+
+    print(f"uninstall is only supported on macOS and Linux (current OS: {sys_name}).", file=sys.stderr)
+    return 2
+
+
+def read_all_log_records(state_dir: Path) -> List[Dict[str, Any]]:
+    records: List[Dict[str, Any]] = []
+    for name in ("wakeup.jsonl.1", "wakeup.jsonl"):
+        p = state_dir / name
+        if not p.is_file():
+            continue
+        try:
+            with p.open("r", encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    s = line.strip()
+                    if not s:
+                        continue
+                    try:
+                        obj = json.loads(s)
+                        if isinstance(obj, dict):
+                            records.append(obj)
+                    except json.JSONDecodeError:
+                        continue
+        except OSError:
+            continue
+    return records
+
+
+def record_has_probe(rec: Dict[str, Any]) -> bool:
+    if rec.get("status") == "activated":
+        return True
+    pools = rec.get("pools")
+    if isinstance(pools, dict):
+        return any(isinstance(v, dict) and v.get("action") == "probed" for v in pools.values())
+    return False
+
+
+def format_record_line(rec: Dict[str, Any]) -> str:
+    ts = rec.get("ts", "?")
+    status = rec.get("status", "?")
+    dur = rec.get("duration_ms", "?")
+    pools = rec.get("pools")
+    parts: List[str] = []
+    if isinstance(pools, dict):
+        for pkey in ("gemini", "3p"):
+            info = pools.get(pkey)
+            if not isinstance(info, dict):
+                continue
+            pct = info.get("remaining_pct_after", info.get("remaining_pct", "?"))
+            rst = info.get("reset_time_after", info.get("reset_time", "?"))
+            act = info.get("action", "none")
+            if act == "probed":
+                probe_meta = info.get("probe") or {}
+                model = probe_meta.get("model", "?")
+                mode = probe_meta.get("mode", "chat_only")
+                ver = info.get("verified_active_after")
+                mode_tag = f",{mode}" if mode != "chat_only" else ""
+                label = "ACTIVATED" if ver is True else "WAKE_SENT"
+                parts.append(f"{pkey}:{label}({model}{mode_tag},verified={ver})->{pct}%@{rst}")
+            elif act != "none":
+                parts.append(f"{pkey}:{act}({pct}%@{rst})")
+            else:
+                parts.append(f"{pkey}:{pct}%@{rst}")
+    err = rec.get("error")
+    summary = " | ".join(parts) if parts else ""
+    if err:
+        summary = f"{summary} | err={err}" if summary else f"err={err}"
+    return f"{ts}  [{status}] ({dur}ms)  {summary}".rstrip()
+
+
+def execute_status(args: argparse.Namespace) -> int:
+    state_dir = default_state_dir()
+    log_path = state_dir / "wakeup.jsonl"
+    sys_name = platform.system()
+
+    print(f"State dir: {state_dir}")
+    print(f"Log file:  {log_path}")
+
+    if sys_name == "Darwin":
+        plist_path = launchd_plist_path()
+        domain_target = f"gui/{os.getuid()}/{LAUNCHD_LABEL}"
+        proc = _run_scheduler_cmd(["launchctl", "print", domain_target])
+        loaded = proc.returncode == 0
+        interval_info = ""
+        if plist_path.is_file():
+            try:
+                with plist_path.open("rb") as f:
+                    pl = plistlib.load(f)
+                cal = pl.get("StartCalendarInterval")
+                if isinstance(cal, list):
+                    ticks = ",".join(f":{int(item['Minute']):02d}" for item in cal if isinstance(item, dict) and "Minute" in item)
+                    sched_str = f"hourly at {ticks}" if ticks else "calendar"
+                elif isinstance(cal, dict) and "Minute" in cal:
+                    sched_str = f"hourly at :{int(cal['Minute']):02d}"
+                elif pl.get("StartInterval") is not None:
+                    sched_str = f"every {pl.get('StartInterval')}s"
+                else:
+                    sched_str = "custom"
+                interval_info = f", schedule={sched_str}, RunAtLoad={pl.get('RunAtLoad')}"
+            except Exception:
+                pass
+        print(
+            f"LaunchAgent ({LAUNCHD_LABEL}): {'LOADED' if loaded else 'NOT LOADED'} "
+            f"(plist={'present' if plist_path.is_file() else 'absent'}{interval_info})"
+        )
+    elif sys_name == "Linux":
+        service_path, timer_path = systemd_user_unit_paths()
+        active_state = "UNKNOWN"
+        if shutil.which("systemctl"):
+            proc = _run_scheduler_cmd(["systemctl", "--user", "is-active", f"{SYSTEMD_UNIT_BASE}.timer"])
+            out_s = (proc.stdout or "").strip()
+            active_state = out_s.upper() if out_s else "UNREACHABLE"
+        sched_info = ""
+        if timer_path.is_file():
+            try:
+                sched_str = ""
+                for raw_line in timer_path.read_text(encoding="utf-8", errors="replace").splitlines():
+                    s_line = raw_line.strip()
+                    if s_line.startswith("OnCalendar="):
+                        cal_val = s_line.split("=", 1)[1].strip()
+                        m_cal = re.search(r"\*:([0-9,]+):00$", cal_val)
+                        if m_cal:
+                            ticks = ",".join(f":{int(tok):02d}" for tok in m_cal.group(1).split(",") if tok.isdigit())
+                            sched_str = f"hourly at {ticks}" if ticks else cal_val
+                        else:
+                            sched_str = cal_val
+                        break
+                    if s_line.startswith("OnUnitActiveSec="):
+                        sched_str = f"every {s_line.split('=', 1)[1].strip()}"
+                        break
+                if sched_str:
+                    sched_info = f", schedule={sched_str}"
+            except OSError:
+                pass
+        linger_state = linux_linger_status()
+        print(
+            f"systemd user timer ({SYSTEMD_UNIT_BASE}.timer): {active_state} "
+            f"(timer={'present' if timer_path.is_file() else 'absent'}, "
+            f"service={'present' if service_path.is_file() else 'absent'}"
+            f"{sched_info}, linger={linger_state})"
+        )
+
+    saved_proxy = load_saved_proxy_env(state_dir)
+    if saved_proxy:
+        print(f"Proxy env: {format_proxy_summary(saved_proxy)} (saved)")
+
+    records = read_all_log_records(state_dir)
+    if not records:
+        print("Logs: no runs recorded yet.")
+        return 0
+
+    activations = [r for r in records if record_has_probe(r)]
+    errors = [r for r in records if r.get("status") in ("error", "partial_error")]
+    print(f"Total recorded runs: {len(records)} | Activations: {len(activations)} | Errors: {len(errors)}")
+    if activations:
+        print(f"Last activation: {format_record_line(activations[-1])}")
+    if errors:
+        print(f"Last error:      {format_record_line(errors[-1])}")
+
+    tail_n = max(1, args.lines)
+    print(f"\nRecent {min(tail_n, len(records))} runs:")
+    for r in records[-tail_n:]:
+        print("  " + format_record_line(r))
+    return 0
+
+
+def execute_logs(args: argparse.Namespace) -> int:
+    records = read_all_log_records(default_state_dir())
+    if args.activations:
+        records = [r for r in records if record_has_probe(r)]
+    elif args.errors:
+        records = [r for r in records if r.get("status") in ("error", "partial_error")]
+    tail = records[-max(1, args.lines) :]
+    for r in tail:
+        if args.json:
+            print(json.dumps(r, ensure_ascii=False))
+        else:
+            print(format_record_line(r))
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog=APP_NAME,
+        description="Check AGY weekly quota buckets via zero-cost /usage and wake up freshly reset pools immediately.",
+    )
+    sub = p.add_subparsers(dest="subcommand", required=True)
+
+    p_run = sub.add_parser("run", help="Run a single quota check and wake up unactivated weekly pools")
+    p_run.add_argument("--pools", default="all", choices=["all", "gemini", "3p"], help="Which weekly quota pools to guard (default: all)")
+    p_run.add_argument("--dry-run", action="store_true", help="Inspect /usage and select models without sending wakeup requests")
+    p_run.add_argument("--force", action="store_true", help="Send minimal wakeup request even if target pool already looks active")
+    p_run.add_argument("--quiet", action="store_true", help="Suppress stdout/stderr JSON output (still writes wakeup.jsonl)")
+    p_run.add_argument("--agy-bin", default=None, help="Explicit path to agy binary")
+    p_run.add_argument("--gemini-model", default=None, help="Override wakeup model ID for Gemini pool")
+    p_run.add_argument("--3p-model", dest="third_party_model", default=None, help="Override wakeup model ID for 3p pool")
+    p_run.add_argument(
+        "--retry-delays",
+        type=parse_retry_delays_arg,
+        default="5,15",
+        help="Comma-separated retry backoff seconds for /usage on transient startup/wake network errors (default: 5,15)",
+    )
+
+    p_inst = sub.add_parser("install", help="Install user-level periodic task (macOS LaunchAgent / Linux systemd --user timer)")
+    p_inst.add_argument(
+        "--interval",
+        type=int,
+        default=DEFAULT_INTERVAL_SECONDS,
+        help=f"Check interval in seconds (default: {DEFAULT_INTERVAL_SECONDS}, scheduled at :03 and :33 past each hour)",
+    )
+    p_inst.add_argument(
+        "--minute-offset",
+        type=int,
+        default=CALENDAR_MINUTE_OFFSET,
+        help=f"Minute offset within the hour for hourly-aligned schedules, 0-59 (default: {CALENDAR_MINUTE_OFFSET}; e.g. 18 -> :18,:48 for 30m)",
+    )
+    p_inst.add_argument("--pools", default="all", choices=["all", "gemini", "3p"], help="Which weekly pools to guard (default: all)")
+    p_inst.add_argument("--agy-bin", default=None, help="Explicit path to agy binary to persist in scheduled job")
+    p_inst.add_argument(
+        "--no-proxy",
+        action="store_true",
+        help="Do not inherit shell proxy env vars and clear any saved proxy config",
+    )
+
+    sub.add_parser("uninstall", help="Unload and remove user-level periodic task")
+
+    p_stat = sub.add_parser("status", help="Show scheduler state and recent log summary")
+    p_stat.add_argument("-n", "--lines", type=int, default=10, help="Number of recent log entries to show (default: 10)")
+
+    p_logs = sub.add_parser("logs", help="View or filter recorded runs")
+    p_logs.add_argument("-n", "--lines", type=int, default=30, help="Number of matching entries to print (default: 30)")
+    log_filter = p_logs.add_mutually_exclusive_group()
+    log_filter.add_argument("--activations", action="store_true", help="Show only runs that sent a wakeup request")
+    log_filter.add_argument("--errors", action="store_true", help="Show only runs with errors")
+    p_logs.add_argument("--json", action="store_true", help="Output raw JSONL lines")
+
+    return p
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    raw_args = list(sys.argv[1:] if argv is None else argv)
+    if not raw_args or (raw_args[0].startswith("-") and raw_args[0] not in ("-h", "--help")):
+        raw_args = ["run", *raw_args]
+    parser = build_parser()
+    args = parser.parse_args(raw_args)
+    if args.subcommand == "run":
+        return execute_run(args)
+    if args.subcommand == "install":
+        return execute_install(args)
+    if args.subcommand == "uninstall":
+        return execute_uninstall(args)
+    if args.subcommand == "status":
+        return execute_status(args)
+    if args.subcommand == "logs":
+        return execute_logs(args)
+    parser.print_help()
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())
