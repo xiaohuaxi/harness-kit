@@ -208,7 +208,7 @@ None of the perks below require a Google Cloud Billing account. Inspect them rea
    - Check membership status on both pages (availability depends on account region):
      `https://www.youtube.com/paid_memberships`
      `https://one.google.com/benefits`
-   - Tier & conflict rules: Eligible paid `Pro` primary accounts without an existing standalone YouTube plan automatically activate `YouTube Premium Lite` (ad-free on most non-music videos, no YouTube Music, non-shareable). On `Ultra 5x / 20x` in supported regions, Google automatically upgraded the perk to the full **`YouTube Premium Family` plan** (site-wide ad-free, background play, offline downloads, YouTube Music, shareable with up to 5 family members for 6 total). If the account already has a separate paid YouTube plan preventing activation, **report the conflict neutrally and never push the user to cancel an existing subscription**.
+   - Tier & conflict rules: Eligible paid `Pro` primary accounts without an existing standalone YouTube plan automatically activate `YouTube Premium Lite` (ad-free on most non-music videos, no YouTube Music, non-shareable). On `Ultra 5x / 20x` in supported regions, Google automatically upgraded the perk to the full **`YouTube Premium Family` plan** (site-wide ad-free, background play, offline downloads, YouTube Music, shareable with up to 5 family members for 6 total; the Ultra subscriber must be the Google family manager to share). If the account already has a separate paid YouTube plan preventing activation, **report the conflict neutrally and never push the user to cancel an existing subscription**.
    - Hardware & region extras: Ultra also includes `Project Genie` (Genie 3 real-time 3D worlds, 60s sessions), region-gated `Chrome auto-browse` / calling experiments, `Google Home Premium` (requires Nest hardware), and `Fitbit / Health Premium` (requires Pixel Watch / Fitbit); note these only if relevant to the user's region/hardware.
 
 2. Perk 4: `Google One Storage` (`5 TB / 20 TB / 30 TB` with zero egress fees)
@@ -228,26 +228,26 @@ None of the perks below require a Google Cloud Billing account. Inspect them rea
      `https://flowmusic.app`
    - `10,000` credits yield roughly `2,000` songs and `30,000` yield roughly `6,000` songs (`~5 credits/song`), powered by `Lyria 3.5` with vocal/instrumental generation, stems, and royalty-free commercial license (web-only).
 
-5. Perk 7: `NotebookLM` (`300 / 500 / 600` sources per notebook)
+5. Perk 7: `Gemini Notebook` (formerly `NotebookLM`, `300 / 500 / 600` sources per notebook)
    - Check upgrade badge next to avatar or click `Add sources` in any notebook:
      `https://notebooklm.google.com`
    - Expected limits: Free is `50` sources; `Pro` is `300`; `Ultra 5x (20 TB)` is `500` (`600` for note sources); `Ultra 20x (30 TB)` is `600`. All three paid tiers support up to `500` notebooks.
 
-### Sunset Corrections (June 2026)
+### Sunset Corrections (2026)
 
-Inform the user that two perks still listed in older community posts were **retired in June 2026**:
-- "30 Firebase Studio workspaces" (new workspace creation ended June 22, 2026);
-- Consumer "Gemini Code Assist IDE plugin / legacy Gemini CLI" for personal, Pro, and Ultra accounts (ended June 18, 2026).
+Inform the user about two perks still listed in older community posts:
+- "30 Firebase Studio workspaces": new workspace creation and sign-ups ended June 22, 2026 (full shutdown scheduled for March 22, 2027);
+- Consumer "Gemini Code Assist IDE plugin / legacy Gemini CLI" for personal, Pro, and Ultra accounts: ended June 18, 2026.
 
-Both have consolidated into `AI Studio` and `Antigravity` (VS Code / JetBrains extensions available), so there is no need to hunt for them.
+Both workflows have consolidated into `AI Studio` and `Antigravity` (VS Code / JetBrains extensions available), so there is no need to hunt for them.
 
 ## 8. Stage 5: Deliver the Full Perks Verification Summary
 
 Once all checks and configurations finish, present a concise summary table covering all 7 active perks plus optional extras:
 1. `Cloud & Gemini API Credits` (Developer Program link & auto-apply checkbox, credit balance & earliest expiry, Prepay/Postpay mode, `Auto-reload` & `Spend Cap` status, API key smoke test & saved path);
 2. `Colab GPU Compute Units` (`google-colab-cli` & `~/.gemini/config/skills/colab-operator` status, remaining `CU` balance, smoke test teardown confirmation);
-3. `YouTube Premium & Extras` (active Lite / Family plan status, region/hardware notes, or existing-plan conflict);
+3. `YouTube Premium & Extras` (active Lite / Family plan status, family-manager eligibility for sharing, region/hardware notes, or existing-plan conflict);
 4. `Google One Storage` (`5 TB / 20 TB / 30 TB` total capacity & family sharing status);
 5. `Veo Video (Google Flow)` (monthly video credit balance);
 6. `AI Music (Google Flow Music)` (monthly independent music credit balance);
-7. `NotebookLM` (tier badge & per-notebook source limit: `300 / 500 / 600`).
+7. `Gemini Notebook (formerly NotebookLM)` (tier badge & per-notebook source limit: `300 / 500 / 600`).

@@ -10,7 +10,7 @@
 
 1. **云与 Gemini API 月度赠金（`$10 / $40 / $100`）**：检查开发者权益页绑定与 `Always use this billing account` 自动续领勾选，核对云结算账单赠金余额，关闭 AI Studio 自动充值、配置月度支出上限（`Spend Cap`），并跑通低于 `$0.0001` 的 API 连通测试。
 2. **Colab GPU 算力单元（`200 / 1,000 / 2,000 CU`）**：自动安装官方 `google-colab-cli`，导出挂载官方内置的 `colab-operator` Skill，查询剩余算力余额，并支持按需跑一次 10 秒 `A100` 专属会话连通测试及销毁复核。
-3. **其余 5 项现役福利与停服勘误**：逐项核验 `Google Flow`（Veo 视频生成积分）、`Google Flow Music`（独立音乐积分）、`NotebookLM`（单本 `300 / 500 / 600` 源上限）、`Google 云盘`（`5 / 20 / 30 TB` 容量与家庭共享）及 `YouTube 会员`（Pro 含 Lite 个人版，5x 与 20x 已自动升级为完整家庭版）生效状态，并同步勘误 2026 年 6 月已停服的 `Firebase Studio` 与个人版 `Gemini Code Assist`。
+3. **其余 5 项现役福利与下线勘误**：逐项核验 `Google Flow`（Veo 视频生成积分）、`Google Flow Music`（独立音乐积分）、`Gemini Notebook`（原 `NotebookLM`，单本 `300 / 500 / 600` 源上限）、`Google 云盘`（`5 / 20 / 30 TB` 容量与家庭共享）及 `YouTube 会员`（Pro 含 Lite 个人版，5x 与 20x 含完整家庭版，主号须为家庭管理员方可共享）生效状态，并同步勘误 2026 年下线项（`Firebase Studio` 6 月 22 日停止新建、2027 年 3 月 22 日正式关停；个人版 `Gemini Code Assist` 与旧 `Gemini CLI` 6 月 18 日停服）。
 
 ## 怎么用
 

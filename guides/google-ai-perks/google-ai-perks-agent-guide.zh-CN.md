@@ -214,7 +214,7 @@ COLAB_BIN="$(command -v colab || echo "$HOME/.local/bin/colab")"
      `https://flowmusic.app`
    - `10,000` 积分约合 `2,000` 首、`30,000` 积分约合 `6,000` 首，基于 `Lyria 3.5` 支持人声/器乐生成与分轨，含商用免版权授权（走网页端使用）。
 
-3. 福利 5：`NotebookLM` 高阶知识库（单本 `300 / 500 / 600` 源）
+3. 福利 5：`Gemini Notebook`（原 `NotebookLM`，单本 `300 / 500 / 600` 源）
    - 打开以下网址查看右上角头像旁的升级标识，或点开任一笔记本的 `Add sources` 查看单本常规来源上限：
      `https://notebooklm.google.com`
    - 分档核验标准：免费版仅 `50` 源；`Pro` 为 `300` 源；`Ultra 5x（20 TB）` 为 `500` 源（笔记类来源 `600`）；`Ultra 20x（30 TB）` 为 `600` 源，三档付费版均支持最多 `500` 个笔记本。
@@ -233,11 +233,11 @@ COLAB_BIN="$(command -v colab || echo "$HOME/.local/bin/colab")"
    - 分档与冲突规则：符合地区条件的付费 `Pro` 主号在无既有独立 YouTube 会员时，`YouTube Premium Lite` 个人版会**自动生效**（大多数非音乐视频免广告，不含 YouTube Music 且不可家庭共享）；`Ultra 5x / 20x` 在支持地区已由官方自动升级为 **`YouTube Premium Family` 完整家庭版**（全站免广告、后台播放、离线下载与 YouTube Music，主号作为家庭组管理员可与最多 5 位家庭成员共 6 人共享）。若检测到账号已有单独付费的 YouTube 会员导致未叠加生效，**仅向用户如实报告冲突现状，不要擅自引导取消原有订阅**。
    - 其他限定项：Ultra 另附 `Project Genie`（Genie 3 实时 3D 世界，单次 60 秒）及美印等地区限定的 `Chrome 自动浏览` / 代打电话实验功能，`Google Home Premium`（需 Nest 设备）与 `Fitbit / Health Premium`（需 Pixel Watch / Fitbit）按硬件持有情况标注。
 
-### 2026 年 6 月停服旧福利勘误
+### 2026 年旧福利下线勘误
 
-同时告知用户，社区过时攻略仍常提的两项旧福利均已于 **2026 年 6 月停服**：
-- 「赠送 30 个 Firebase Studio 工作区」（已于 2026 年 6 月 22 日停止新建）；
-- 面向个人、Google AI Pro 与 Ultra 账号的「个人版 Gemini Code Assist IDE 插件 / 旧 Gemini CLI」（已于 2026 年 6 月 18 日停服）。
+同时告知用户，社区过时攻略仍常提的两项旧福利的真实状态：
+- 「赠送 30 个 Firebase Studio 工作区」：已于 2026 年 6 月 22 日停止新建工作区与注册，正式关停时间为 2027 年 3 月 22 日；
+- 面向个人、Google AI Pro 与 Ultra 账号的「个人版 Gemini Code Assist IDE 插件 / 旧 Gemini CLI」：已于 2026 年 6 月 18 日停服。
 
 官方已统一迁入 `AI Studio` 与 `Antigravity`（VS Code / JetBrains 可直接装 `Antigravity` 官方扩展），无需再找。
 
@@ -248,6 +248,6 @@ COLAB_BIN="$(command -v colab || echo "$HOME/.local/bin/colab")"
 2. `GPU 算力单元（Colab）`（CLI 与 `~/.gemini/config/skills/colab-operator` 安装状态、剩余 `CU` 余额、测试实例已清理确认）；
 3. `Veo 视频（Google Flow）`（当月视频积分余额）；
 4. `AI 音乐（Google Flow Music）`（当月独立音乐积分余额）；
-5. `NotebookLM`（套餐标识与单本来源上限：`300` / `500` / `600`）；
+5. `Gemini Notebook（原 NotebookLM）`（套餐标识与单本来源上限：`300` / `500` / `600`）；
 6. `Google 云盘`（总存储容量 `5 TB / 20 TB / 30 TB` 及家庭共享状态）；
-7. `YouTube 会员与扩展限定项`（当前生效状态、地区/硬件匹配情况，或既有订阅冲突说明）。
+7. `YouTube 会员与扩展限定项`（当前生效状态、家庭管理员共享条件、地区/硬件匹配情况，或既有订阅冲突说明）。
