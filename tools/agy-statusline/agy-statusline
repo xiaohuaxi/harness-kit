@@ -1,0 +1,508 @@
+#!/usr/bin/env bash
+# Antigravity CLI (agy) statusLine command
+# Segments: cwd · model · effort · ctx-usage · quota(Gemini / Claude) · git-branch · cost
+input=$(cat)
+
+# ── Soft 256-color palette ───────────────────────────────────────────────────
+RESET=$'\033[0m'
+# Medium gray slightly brighter than ANSI faint for secondary metadata
+DIM=$'\033[38;5;242m'
+# Slightly brighter gray for context used/total readability
+DIM_BRIGHT=$'\033[38;5;245m'
+BOLD_BLUE=$'\033[1;34m'
+# Muted non-bold 256-color tones for informative accents
+SOFT_GREEN=$'\033[38;5;108m'   # Sage green (effort)
+SOFT_AMBER=$'\033[38;5;137m'   # Deep amber (percentages)
+SOFT_CYAN=$'\033[38;5;73m'     # Muted cyan (model)
+SEP="${DIM} · ${RESET}"
+
+FALLBACK_CWD="$(pwd)"
+
+# ── Extract fields in one Python pass and eval into shell variables ──────────
+eval "$(FALLBACK_CWD="$FALLBACK_CWD" python3 -c '
+import datetime
+import json
+import os
+import re
+import sys
+import tempfile
+import time
+
+
+def expand_home(path):
+    if not path:
+        return ""
+    home = os.environ.get("HOME", "")
+    if path == "~":
+        return home or os.path.expanduser("~")
+    if path.startswith("~/"):
+        return os.path.join(home, path[2:]) if home else os.path.expanduser(path)
+    return path
+
+
+def normalize_dir(path):
+    if not path:
+        return ""
+    stripped = path.rstrip("/")
+    return stripped if stripped else "/"
+
+
+def format_cwd_display(cwd, aliases_raw):
+    if not cwd:
+        return ""
+    norm_cwd = normalize_dir(cwd)
+    rules = []
+    for entry in (aliases_raw or "").split(":"):
+        if "=" not in entry:
+            continue
+        raw_prefix, alias = (part.strip() for part in entry.split("=", 1))
+        prefix = normalize_dir(expand_home(raw_prefix))
+        if prefix and alias:
+            rules.append((prefix, alias))
+
+    for prefix, alias in sorted(rules, key=lambda item: len(item[0]), reverse=True):
+        if norm_cwd == prefix:
+            return alias
+        if prefix == "/" and norm_cwd.startswith("/"):
+            rest = norm_cwd.lstrip("/")
+            base = "" if alias == "/" else alias.rstrip("/")
+            return f"{base}/{rest}" if rest else alias
+        if norm_cwd.startswith(prefix + "/"):
+            base = "" if alias == "/" else alias.rstrip("/")
+            return f"{base}/{norm_cwd[len(prefix) + 1:]}"
+
+    home = os.environ.get("HOME", "")
+    norm_home = home.rstrip("/") if home else ""
+    if norm_home:
+        if norm_cwd == norm_home:
+            return "~"
+        if norm_cwd.startswith(norm_home + "/"):
+            return "~" + norm_cwd[len(norm_home):]
+    return cwd
+
+
+def parse_iso_dt(rt):
+    if not isinstance(rt, str) or not rt:
+        return None
+    s = rt.strip()
+    if s.endswith(("Z", "z")):
+        s = s[:-1] + "+00:00"
+    # Normalize fractional seconds and ±HHMM offset for Python 3.7-3.10 fromisoformat compatibility.
+    s = re.sub(r"([+-]\d{2})(\d{2})$", r"\1:\2", s)
+    m = re.match(r"^(\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2})\.(\d+)(.*)$", s)
+    if m:
+        frac = (m.group(2) + "000000")[:6]
+        s = f"{m.group(1)}.{frac}{m.group(3)}"
+    return datetime.datetime.fromisoformat(s).astimezone()
+
+
+def as_str(val):
+    return val if isinstance(val, str) else ""
+
+
+def as_int(val):
+    if isinstance(val, bool) or val is None:
+        return 0
+    try:
+        return int(val)
+    except Exception:
+        return 0
+
+
+def fmt_tokens(n):
+    if n is None or n == "":
+        return ""
+    if n >= 1_000_000:
+        return f"{n // 1_000_000}M"
+    if n >= 1000:
+        return f"{n // 1000}k"
+    return str(n)
+
+
+def atomic_write_json(path, payload):
+    parent = os.path.dirname(path) or "."
+    os.makedirs(parent, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(prefix=".quota-cache.", suffix=".tmp", dir=parent)
+    try:
+        try:
+            f = os.fdopen(fd, "w", encoding="utf-8")
+        except Exception:
+            os.close(fd)
+            raise
+        with f:
+            json.dump(payload, f)
+        os.replace(tmp_path, path)
+    except Exception:
+        try:
+            os.unlink(tmp_path)
+        except Exception:
+            pass
+        raise
+
+
+try:
+    d = json.loads(sys.stdin.read())
+    if not isinstance(d, dict):
+        d = {}
+except Exception:
+    d = {}
+
+# Resolve state directory (transcript fallback, quota cache, and default quota log)
+raw_state_dir = os.environ.get("AGY_STATUSLINE_STATE_DIR", "").strip()
+if raw_state_dir:
+    state_dir = expand_home(raw_state_dir)
+else:
+    home_dir = os.environ.get("HOME") or os.path.expanduser("~")
+    state_dir = os.path.join(home_dir, ".gemini", "antigravity-cli")
+
+# 1. cwd / workspace
+ws = d.get("workspace")
+ws_dir = as_str(ws.get("current_dir")) if isinstance(ws, dict) else ""
+cwd = as_str(d.get("cwd")) or ws_dir or os.environ.get("FALLBACK_CWD") or ""
+cwd_disp = format_cwd_display(cwd, os.environ.get("AGY_STATUSLINE_PATH_ALIASES", ""))
+
+# 2. model & effort
+m_obj = d.get("model")
+if not isinstance(m_obj, dict):
+    m_obj = {}
+raw_model = as_str(m_obj.get("display_name")) or as_str(m_obj.get("id"))
+effort = as_str(m_obj.get("effort"))
+if not effort and isinstance(d.get("effort"), dict):
+    effort = as_str(d["effort"].get("level"))
+elif not effort and isinstance(d.get("effort"), str):
+    effort = d["effort"]
+if not effort:
+    m = re.search(r"\((Low|Medium|High|XHigh|Max)\)", raw_model, re.I)
+    if m:
+        effort = m.group(1).lower()
+
+clean_model = re.sub(r"\s*\((Low|Medium|High|XHigh|Max)\)\s*$", "", raw_model, flags=re.I).strip()
+for prefix in ("Claude ", "Gemini ", "GPT "):
+    if clean_model.startswith(prefix):
+        clean_model = clean_model[len(prefix):]
+        break
+
+# 3. context window usage & compact count
+cw = d.get("context_window")
+if not isinstance(cw, dict):
+    cw = {}
+cu = cw.get("current_usage")
+if not isinstance(cu, dict):
+    cu = {}
+used = (
+    as_int(cu.get("input_tokens"))
+    + as_int(cu.get("cache_creation_input_tokens"))
+    + as_int(cu.get("cache_read_input_tokens"))
+)
+if used == 0:
+    used = as_int(cw.get("total_input_tokens"))
+total = as_int(cw.get("context_window_size"))
+pct = cw.get("used_percentage")
+
+compacts = 0
+tp = as_str(d.get("transcript_path"))
+cid = as_str(d.get("conversation_id")) or as_str(d.get("session_id"))
+# agy BuildStatusLineData may omit the -cli suffix in transcript_path; fall back to state_dir.
+if cid and (not tp or not os.path.exists(tp)):
+    tp = os.path.join(state_dir, "brain", cid, ".system_generated", "logs", "transcript.jsonl")
+if tp:
+    try:
+        with open(tp, "rb") as f:
+            compacts = f.read().count(b"\"source\":\"SYSTEM\",\"type\":\"CHECKPOINT\"")
+    except Exception:
+        compacts = 0
+
+def normalize_quota_for_cache(quota):
+    now_ts = time.time()
+    normalized = {}
+    for k, v in quota.items():
+        if not isinstance(v, dict):
+            normalized[k] = v
+            continue
+        item = dict(v)
+        has_valid_rt = False
+        if isinstance(item.get("reset_time"), str) and item["reset_time"].strip():
+            try:
+                has_valid_rt = parse_iso_dt(item["reset_time"]) is not None
+            except Exception:
+                has_valid_rt = False
+        ris = item.get("reset_in_seconds")
+        if not has_valid_rt and not isinstance(ris, bool) and ris is not None:
+            try:
+                secs = float(ris)
+                if secs > 0:
+                    target_dt = datetime.datetime.fromtimestamp(now_ts + secs, tz=datetime.timezone.utc)
+                    item["reset_time"] = target_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+                    item.pop("reset_in_seconds", None)
+            except Exception:
+                pass
+        normalized[k] = item
+    return normalized
+
+
+# 4. quotas: Gemini and 3P/Claude independent pools with atomic local cache
+raw_quota = d.get("quota")
+if not isinstance(raw_quota, dict):
+    raw_quota = {}
+cache_file = os.path.join(state_dir, "quota-cache.json")
+if not raw_quota:
+    try:
+        with open(cache_file, "r", encoding="utf-8") as f:
+            loaded = json.load(f)
+            if isinstance(loaded, dict):
+                raw_quota = loaded
+    except Exception:
+        raw_quota = {}
+else:
+    try:
+        atomic_write_json(cache_file, normalize_quota_for_cache(raw_quota))
+    except Exception:
+        pass
+
+
+def parse_bucket(b, mode="clock"):
+    if not isinstance(b, dict):
+        return None, ""
+    b_pct = None
+    if b.get("used_percentage") is not None:
+        try:
+            b_pct = round(float(b["used_percentage"]))
+        except Exception:
+            b_pct = None
+    elif b.get("remaining_fraction") is not None:
+        try:
+            b_pct = round((1.0 - float(b["remaining_fraction"])) * 100)
+        except Exception:
+            b_pct = None
+    reset = ""
+    rt = b.get("reset_time")
+    if mode == "days":
+        if rt:
+            try:
+                dt = parse_iso_dt(rt)
+                if dt is not None:
+                    now = datetime.datetime.now().astimezone()
+                    days = max(0.0, (dt - now).total_seconds() / 86400.0)
+                    reset = f"{days:.1f}d"
+            except Exception:
+                pass
+        elif b.get("reset_in_seconds") is not None:
+            try:
+                days = max(0.0, float(b["reset_in_seconds"]) / 86400.0)
+                reset = f"{days:.1f}d"
+            except Exception:
+                pass
+    else:
+        if rt:
+            try:
+                dt = parse_iso_dt(rt)
+                if dt is not None:
+                    now = datetime.datetime.now().astimezone()
+                    same_day = dt.date() == now.date()
+                    reset = dt.strftime("%H:%M" if same_day else "%m-%d %H:%M")
+            except Exception:
+                pass
+        elif b.get("reset_in_seconds") is not None:
+            try:
+                target_ts = time.time() + float(b["reset_in_seconds"])
+                lt = time.localtime(target_ts)
+                same_day = time.strftime("%Y%m%d", lt) == time.strftime("%Y%m%d")
+                reset = time.strftime("%H:%M" if same_day else "%m-%d %H:%M", lt)
+            except Exception:
+                pass
+    return b_pct, reset
+
+
+g_w_bucket, g_5_bucket = None, None
+c_w_bucket, c_5_bucket = None, None
+
+for k, v in raw_quota.items():
+    low = str(k).lower()
+    is_3p_or_claude = any(x in low for x in ("3p", "claude", "gpt", "third"))
+    is_gemini = "gemini" in low
+    is_5h = any(x in low for x in ("5h", "five", "hour"))
+    is_weekly = any(x in low for x in ("week", "7d"))
+
+    if is_3p_or_claude:
+        if is_5h:
+            c_5_bucket = v
+        elif is_weekly:
+            c_w_bucket = v
+    elif is_gemini:
+        if is_5h:
+            g_5_bucket = v
+        elif is_weekly:
+            g_w_bucket = v
+    else:
+        if is_5h and not g_5_bucket:
+            g_5_bucket = v
+        elif is_weekly and not g_w_bucket:
+            g_w_bucket = v
+
+g_7d, g_reset7d = parse_bucket(g_w_bucket, mode="days")
+g_5h, g_reset5h = parse_bucket(g_5_bucket, mode="clock")
+c_7d, c_reset7d = parse_bucket(c_w_bucket, mode="days")
+c_5h, c_reset5h = parse_bucket(c_5_bucket, mode="clock")
+
+# Opt-in quota change log (disabled by default)
+raw_quota_log = os.environ.get("AGY_STATUSLINE_QUOTA_LOG", "").strip()
+low_quota_log = raw_quota_log.lower()
+if not raw_quota_log or low_quota_log in ("0", "false"):
+    log_file = ""
+elif low_quota_log in ("1", "true"):
+    log_file = os.path.join(state_dir, "quota-log.jsonl")
+else:
+    log_file = expand_home(raw_quota_log)
+
+if log_file and any(x is not None for x in (g_7d, g_5h, c_7d, c_5h)):
+    try:
+        rec = {
+            "g_7d": g_7d,
+            "g_5h": g_5h,
+            "g_reset": g_reset5h,
+            "c_7d": c_7d,
+            "c_5h": c_5h,
+            "c_reset": c_reset5h,
+        }
+        prev = {}
+        try:
+            with open(log_file, "rb") as f:
+                f.seek(0, 2)
+                f.seek(max(0, f.tell() - 1024))
+                lines = f.read().decode("utf-8", errors="ignore").strip().splitlines()
+                if lines:
+                    parsed = json.loads(lines[-1])
+                    if isinstance(parsed, dict):
+                        prev = parsed
+        except Exception:
+            pass
+        if any(prev.get(k) != v for k, v in rec.items()):
+            log_dir = os.path.dirname(log_file)
+            if log_dir:
+                os.makedirs(log_dir, exist_ok=True)
+            with open(log_file, "a", encoding="utf-8") as f:
+                f.write(json.dumps({"ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"), **rec}) + "\n")
+    except Exception:
+        pass
+
+# 5. cost (if provided by agy)
+cost_obj = d.get("cost")
+cost = cost_obj.get("total_cost_usd") if isinstance(cost_obj, dict) else None
+cost_str = ""
+if cost is not None:
+    try:
+        cost_str = f"{float(cost):.2f}"
+    except Exception:
+        cost_str = ""
+
+pct_str = ""
+if pct is not None:
+    try:
+        pct_str = f"{round(float(pct))}"
+    except Exception:
+        pct_str = ""
+
+out = {
+    "cwd":       cwd,
+    "cwd_disp":  cwd_disp,
+    "model":     clean_model,
+    "effort":    effort,
+    "used":      fmt_tokens(used) if used > 0 else "",
+    "total":     fmt_tokens(total) if total > 0 else "",
+    "pct":       pct_str,
+    "compacts":  str(compacts) if compacts > 0 else "",
+    "g_7d":      "" if g_7d is None else f"{g_7d}",
+    "g_reset7d": g_reset7d,
+    "g_5h":      "" if g_5h is None else f"{g_5h}",
+    "g_reset5h": g_reset5h,
+    "c_7d":      "" if c_7d is None else f"{c_7d}",
+    "c_reset7d": c_reset7d,
+    "c_5h":      "" if c_5h is None else f"{c_5h}",
+    "c_reset5h": c_reset5h,
+    "cost":      cost_str,
+}
+
+for k, v in out.items():
+    safe = str(v).replace("\x27", "\x27\\\x27\x27")
+    print(f"_{k}=\x27{safe}\x27")
+' <<< "$input")"
+
+# ── segment 1: cwd ───────────────────────────────────────────────────────────
+cwd="${_cwd:-$FALLBACK_CWD}"
+cwd_disp="${_cwd_disp:-$cwd}"
+seg1=$(printf "${BOLD_BLUE}%s${RESET}" "$cwd_disp")
+
+# ── segment 2: model ─────────────────────────────────────────────────────────
+seg2=""
+[ -n "$_model" ] && seg2=$(printf "${SOFT_CYAN}%s${RESET}" "$_model")
+
+# ── segment 3: effort ────────────────────────────────────────────────────────
+seg3=""
+[ -n "$_effort" ] && seg3=$(printf "${SOFT_GREEN}%s${RESET}" "$_effort")
+
+# ── segment 4: context usage ─────────────────────────────────────────────────
+seg4=""
+if [ -n "$_used" ] && [ -n "$_total" ]; then
+  if [ -n "$_pct" ]; then
+    seg4=$(printf "${DIM_BRIGHT}%s/%s${RESET} ${SOFT_AMBER}%s%%${RESET}" \
+      "$_used" "$_total" "$_pct")
+  else
+    seg4=$(printf "${DIM_BRIGHT}%s/%s${RESET}" "$_used" "$_total")
+  fi
+  [ -n "$_compacts" ] && seg4="${seg4}$(printf " ${DIM}⛁ %s${RESET}" "$_compacts")"
+fi
+
+# ── segment 5: quota usage (Gemini & 3P/Claude independent pools) ────────────
+seg5=""
+seg_g=""
+if [ -n "$_g_7d" ] || [ -n "$_g_5h" ]; then
+  seg_g_items=""
+  if [ -n "$_g_7d" ]; then
+    item_7d=$(printf "${DIM}7d${RESET} ${SOFT_AMBER}%s%%${RESET}" "$_g_7d")
+    [ -n "$_g_reset7d" ] && item_7d="${item_7d}$(printf " ${DIM}↻ %s${RESET}" "$_g_reset7d")"
+    seg_g_items="$item_7d"
+  fi
+  if [ -n "$_g_5h" ]; then
+    item_5h=$(printf "${DIM}5h${RESET} ${SOFT_AMBER}%s%%${RESET}" "$_g_5h")
+    [ -n "$_g_reset5h" ] && item_5h="${item_5h}$(printf " ${DIM}↻ %s${RESET}" "$_g_reset5h")"
+    seg_g_items="${seg_g_items:+${seg_g_items} }${item_5h}"
+  fi
+  [ -n "$seg_g_items" ] && seg_g=$(printf "${DIM}G:${RESET} %s" "$seg_g_items")
+fi
+
+# Deliberately render only the 7d weekly bucket for 3P/Claude to keep the bar concise
+# (c_5h is still parsed and recorded when quota logging is enabled).
+seg_c=""
+if [ -n "$_c_7d" ]; then
+  item_7d=$(printf "${DIM}7d${RESET} ${SOFT_AMBER}%s%%${RESET}" "$_c_7d")
+  [ -n "$_c_reset7d" ] && item_7d="${item_7d}$(printf " ${DIM}↻ %s${RESET}" "$_c_reset7d")"
+  seg_c=$(printf "${DIM}C:${RESET} %s" "$item_7d")
+fi
+
+if [ -n "$seg_g" ] && [ -n "$seg_c" ]; then
+  seg5="${seg_g}${SEP}${seg_c}"
+elif [ -n "$seg_g" ]; then
+  seg5="$seg_g"
+elif [ -n "$seg_c" ]; then
+  seg5="$seg_c"
+fi
+
+# ── segment 6: git branch ────────────────────────────────────────────────────
+seg6=""
+if [ -n "$cwd" ] && git -C "$cwd" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  branch=$(git -C "$cwd" symbolic-ref --short HEAD 2>/dev/null \
+    || git -C "$cwd" rev-parse --short HEAD 2>/dev/null)
+  [ -n "$branch" ] && seg6=$(printf "${DIM}%s${RESET}" "$branch")
+fi
+
+# ── segment 7: cost ──────────────────────────────────────────────────────────
+seg7=""
+[ -n "$_cost" ] && seg7=$(printf "${DIM}\$%s${RESET}" "$_cost")
+
+# ── Assemble final status line ───────────────────────────────────────────────
+output="$seg1"
+for seg in "$seg2" "$seg3" "$seg4" "$seg5" "$seg6" "$seg7"; do
+  [ -n "$seg" ] && output="${output}${SEP}${seg}"
+done
+
+printf "%s" "$output"
