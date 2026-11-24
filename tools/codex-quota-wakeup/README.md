@@ -10,12 +10,12 @@ Codex subscription weekly quota windows (`~10080` minutes / 7 days, compatible w
 
 ## How It Works
 
-1. **Zero-Token Polling**: Runs every 30 minutes by default at `:03` and `:33` (plus catch-up on login / wake from sleep) via `codex app-server` stdio JSON-RPC to read effective config, subscription login state, and rate-limit windows (0 tokens, no session files created):
+1. **Zero-Token Polling**: Runs every 30 minutes by default at `:03` and `:33` (skipping immediate post-reboot bursts and waiting until system uptime reaches 300s via `--min-uptime 300`) via `codex app-server` stdio JSON-RPC to read effective config, subscription login state, and rate-limit windows (0 tokens, no session files created):
    - **Active**: `usedPercent > 0`, `resetsAt` is within window length minus 15 minutes, or any quota window is exhausted/limited—logs and exits with zero token usage.
    - **Unactivated**: `usedPercent == 0` (100% remaining) and 3 consecutive samples under the same account identity confirm `resetsAt` is continuously drifting forward with wall-clock time (prevents false triggers right after a first request while integer `usedPercent` still rounds to `0%`).
 2. **Isolated Minimal Wakeup Request**: Once confirmed unactivated, sends a minimal ephemeral read-only request in an empty temporary directory (`codex exec --ephemeral --ignore-user-config --ignore-rules --skip-git-repo-check --sandbox read-only`, replying `OK`), then re-queries `account/rateLimits/read` to verify the 7-day countdown is locked. Total consumption per wakeup is typically well under `0.01%` of the weekly quota.
 3. **Zero-Maintenance Across Model Upgrades**: Never hardcodes model versions; uses Codex's built-in default model with `low` reasoning effort by default (overridable via `--model` / `--effort`).
-4. **Cross-Platform User-Level Scheduling**: Uses user-level `~/Library/LaunchAgents` (`launchd` `StartCalendarInterval`) on macOS and `~/.config/systemd/user/` (`systemd --user` timer with `Persistent=true`) on Linux—missed ticks after sleep coalesce into a single catch-up run without touching system directories or root privileges.
+4. **Cross-Platform User-Level Scheduling**: Uses user-level `~/Library/LaunchAgents` (`launchd` `StartCalendarInterval`, `RunAtLoad=false`) on macOS and `~/.config/systemd/user/` (`systemd --user` timer with `OnCalendar`, without `OnStartupSec` or `Persistent=true`) on Linux—without touching system directories or root privileges. `install` triggers one immediate initial check, while subsequent system reboots naturally defer to the next scheduled tick with a 5-minute boot grace guard (`--min-uptime 300`) so checks wait for networking and local services to settle.
 
 ## Safety & Anti-Loop Guardrails
 
@@ -37,7 +37,7 @@ mkdir -p ~/.local/bin && cp codex-quota-wakeup ~/.local/bin/
 ```
 
 > - `install` writes the script's current path into the OS scheduler. Copy it to a stable directory such as `~/.local/bin` first—avoid installing directly from `~/Downloads`, `~/Desktop`, or `~/Documents`. If `codex-quota-wakeup` is not found in your shell, add `~/.local/bin` to `PATH` or invoke it by full path.
-> - To change options, script path, or proxy settings, re-run `install` directly to update idempotently (no need to `uninstall` first; pass all optional flags you want to keep).
+> - To change options, script path, or proxy settings—or after upgrading the script—re-run `install` directly with your original flags to refresh the existing LaunchAgent / systemd timer configuration idempotently (no need to `uninstall` first; if you configured `crontab` manually, add `--min-uptime 300` to the cron command).
 > - Enabling it on one primary machine per subscription is usually enough. If you run it on multiple machines (e.g. macOS + Linux), add `--minute-offset 18` on one machine (`:18` / `:48`) to avoid duplicate probes at the exact same minute.
 > - If you frequently switch accounts or workspaces under default `~/.codex`, isolate background wakeup credentials with a dedicated `CODEX_HOME`: `CODEX_HOME=~/.codex-wakeup codex login && CODEX_HOME=~/.codex-wakeup codex-quota-wakeup install`.
 
@@ -83,6 +83,7 @@ codex-quota-wakeup logs --json -n 20
 | `run` | `--dry-run` / `--force` | Check only without sending / force one minimal wakeup (still subject to cooldown and 7-day cap) |
 | `run` | `--effort LEVEL` | Override reasoning effort for the wakeup turn (default `low`) |
 | `run` | `--retry-delays LIST` | Retry delay list in seconds for transient network errors (default `5,15`) |
+| `run` | `--min-uptime SECONDS` | Wait until OS uptime reaches this threshold before checking (`0-3600`, default `0`; scheduled jobs pass `300`) |
 | Env var | `CODEX_HOME` | Dedicated Codex config and login directory |
 | Env var | `CODEX_QUOTA_WAKEUP_STATE_DIR` | Override the state and log directory (keep consistent across subcommands after install) |
 
@@ -91,7 +92,7 @@ Run `codex-quota-wakeup --help` or `codex-quota-wakeup <subcommand> --help` for 
 ## Proxy Inheritance & Linux / WSL2 Notes
 
 - **Automatic Proxy & Custom CA Inheritance**: `install` captures `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, and `NO_PROXY` (case-insensitive) plus `CODEX_CA_CERTIFICATE` / `SSL_CERT_FILE` (resolved to absolute paths) and stores them in `proxy.json` with mode `0600` for background runs (explicit proxy env vars in a foreground run take precedence). Re-run `codex-quota-wakeup install` (or pass `--no-proxy` to clear upstream proxy) whenever your proxy changes; `install` also triggers an initial background check immediately.
-- **Linux / WSL2 & SSH Persistence**: Where `systemctl --user` is available, `install` configures the user timer and automatically runs `loginctl enable-linger` so timers stay active after all SSH sessions disconnect (prints the corresponding `sudo` command if restricted; inspect unit-level issues with `journalctl --user -u codex-quota-wakeup`). If `systemd --user` is unavailable, `install` exits safely and prints a `crontab -e` example including `PATH` (manually remove cron entries when uninstalling). Note that `linger` does not prevent Windows from auto-shutting down idle WSL instances; missed ticks catch up once the instance starts again (`Persistent=true`).
+- **Linux / WSL2 & SSH Persistence**: Where `systemctl --user` is available, `install` configures the user timer and automatically runs `loginctl enable-linger` so timers stay active after all SSH sessions disconnect (prints the corresponding `sudo` command if restricted; inspect unit-level issues with `journalctl --user -u codex-quota-wakeup`). If `systemd --user` is unavailable, `install` exits safely and prints a `crontab -e` example including `PATH` and `--min-uptime 300` (manually remove cron entries when uninstalling). Note that `linger` does not prevent Windows from auto-shutting down idle WSL instances; once the instance starts again, checks resume at the next scheduled tick (with the 300s boot grace period) rather than bursting immediately on startup.
 
 ## State & Log Files
 

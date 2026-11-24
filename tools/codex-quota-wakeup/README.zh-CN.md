@@ -10,12 +10,12 @@ Codex 订阅的周额度窗口（`~10080` 分钟 / 7 天，兼容 `plus` / `pro`
 
 ## 工作方式
 
-1. **平时零消耗探测**：默认每半小时在 `:03`、`:33`（及开机登录 / 休眠唤醒补跑时）通过 `codex app-server` stdio JSON-RPC 读取生效配置、订阅登录态与额度窗口（0 Token、不创建会话文件）：
+1. **平时零消耗探测**：默认每半小时在 `:03`、`:33` 通过 `codex app-server` stdio JSON-RPC 读取生效配置、订阅登录态与额度窗口（0 Token、不创建会话文件）；系统重启后不立即抢跑，而是自然顺延到下一个计划刻度，并由后台默认 `--min-uptime 300` 在开机前 5 分钟内自动宽限等待：
    - **已激活**：`usedPercent > 0`、或 `resetsAt` 距当前已不足窗口时长减 15 分钟、或任一额度窗口已耗尽/受限时，直接记日志退出，零消耗。
    - **未激活**：`usedPercent == 0`（剩余 100%）且同一账号身份下连续 3 次采样确认 `resetsAt` 持续随当前时间向后漂移，才判定为需要唤醒（避免刚发完首条请求但整数百分比仍显示 `0%` 时误触发）。
 2. **隔离的最小唤醒请求**：确认未激活后，在空临时目录内发起一次最小化只读临时请求（`codex exec --ephemeral --ignore-user-config --ignore-rules --skip-git-repo-check --sandbox read-only`，回复 `OK`），随后复查 `account/rateLimits/read` 确认 7 天倒计时已锁定。单次唤醒总消耗通常不足周额度的 `0.01%`。
 3. **跨代免维护**：不硬编码具体模型版本，默认直接使用 Codex 内置默认模型与 `low` 推理深度（可通过 `--model` / `--effort` 手动覆盖）。
-4. **跨平台用户级调度**：macOS 使用用户级 `~/Library/LaunchAgents`（`launchd` `StartCalendarInterval`），Linux 使用用户级 `~/.config/systemd/user/`（`systemd --user` timer + `Persistent=true`），休眠唤醒后错过刻度自动合并补跑一次，不触碰系统级目录或 root 权限。
+4. **跨平台用户级调度**：macOS 使用用户级 `~/Library/LaunchAgents`（`launchd` `StartCalendarInterval`、`RunAtLoad=false`），Linux 使用用户级 `~/.config/systemd/user/`（`systemd --user` timer `OnCalendar`，不设 `OnStartupSec` / `Persistent=true`），不触碰系统级目录或 root 权限。`install` 完成后会立即后台执行一次首跑；系统重启后不抢跑，顺延到下一个正常刻度，并配合默认 `--min-uptime 300` 兜底等待网络与本地服务就绪。
 
 ## 安全与防刷护栏
 
@@ -37,7 +37,7 @@ mkdir -p ~/.local/bin && cp codex-quota-wakeup ~/.local/bin/
 ```
 
 > - `install` 会把当前脚本路径写入系统定时任务，请先放到 `~/.local/bin` 等固定目录再安装，避免直接从 `~/Downloads`、`~/Desktop`、`~/Documents` 等受系统隐私保护或易删目录安装。若提示 `command not found`，将 `~/.local/bin` 加入 `PATH` 或使用完整路径调用。
-> - 修改参数、脚本路径或代理设置后，直接重跑 `install` 即可幂等覆盖更新（无需先 `uninstall`；重装时请带齐需保留的可选参数）。
+> - 修改参数、脚本路径、代理设置或升级脚本后，请带上原安装参数直接重跑一次 `install`，即可幂等刷新已有的 LaunchAgent / systemd 定时配置（无需先 `uninstall`；手工配置 `crontab` 的用户请在对应命令中补上 `--min-uptime 300`）。
 > - 同一订阅账号通常在一台主力设备启用即可；若需在多台设备（如 macOS + Linux）并行守护，可在一端加 `--minute-offset 18` 错开触发分钟（`:18` / `:48`），避免同刻度重复探测。
 > - 若本机经常在默认 `~/.codex` 下切换不同账号或工作区，可用独立 `CODEX_HOME` 隔离后台唤醒登录态：`CODEX_HOME=~/.codex-wakeup codex login && CODEX_HOME=~/.codex-wakeup codex-quota-wakeup install`。
 
@@ -83,6 +83,7 @@ codex-quota-wakeup logs --json -n 20
 | `run` | `--dry-run` / `--force` | 只检不发 / 强制发一次最小唤醒（仍受冷却与 7 天上限约束） |
 | `run` | `--effort LEVEL` | 覆盖唤醒轮次的推理深度（默认 `low`） |
 | `run` | `--retry-delays LIST` | 瞬态网络错误重试间隔秒数列表（默认 `5,15`） |
+| `run` | `--min-uptime SECONDS` | 检测前等待系统开机时长达到该秒数（`0-3600`，默认 `0` 不等待；后台定时任务默认传 `300`） |
 | 环境变量 | `CODEX_HOME` | 指定独立的 Codex 配置与登录目录 |
 | 环境变量 | `CODEX_QUOTA_WAKEUP_STATE_DIR` | 覆盖状态与日志目录（安装后手动跑其他子命令需保持一致） |
 
@@ -91,7 +92,7 @@ codex-quota-wakeup logs --json -n 20
 ## 网络代理与 Linux / WSL2 说明
 
 - **代理与自定义 CA 自动继承**：`install` 时会自动捕获当前终端的 `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY` / `NO_PROXY`（大小写均兼容）以及 `CODEX_CA_CERTIFICATE` / `SSL_CERT_FILE`（转为绝对路径），以 `0600` 权限保存在 `proxy.json` 供后台定时任务继承（运行时若当前进程已显式设置代理则优先使用现场值）。更换或关闭代理后重跑一次 `codex-quota-wakeup install`（或加 `--no-proxy` 清除上游代理）即可刷新；`install` 完成后会立即后台执行一次首跑检查。
-- **Linux / WSL2 与 SSH 常驻**：本机 `systemctl --user` 可用时直接运行 `install` 即可，且会自动调用 `loginctl enable-linger` 让用户定时器在退出全部 SSH 会话后继续常驻（若受系统权限限制会打印对应 `sudo` 命令；unit 级异常可用 `journalctl --user -u codex-quota-wakeup` 排查）。若环境未启用 `systemd --user`，命令会安全退出并打印带 `PATH` 的 `crontab -e` 示例（手工添加的 `cron` 条目停用时需自行移除）。注意 `linger` 不会阻止 Windows 将空闲 WSL 实例自动关机，关机期间不触发，下次启动后 `Persistent=true` 会自动补跑。
+- **Linux / WSL2 与 SSH 常驻**：本机 `systemctl --user` 可用时直接运行 `install` 即可，且会自动调用 `loginctl enable-linger` 让用户定时器在退出全部 SSH 会话后继续常驻（若受系统权限限制会打印对应 `sudo` 命令；unit 级异常可用 `journalctl --user -u codex-quota-wakeup` 排查）。若环境未启用 `systemd --user`，命令会安全退出并打印带 `PATH` 与 `--min-uptime 300` 的 `crontab -e` 示例（手工添加的 `cron` 条目停用时需自行移除）。注意 `linger` 不会阻止 Windows 将空闲 WSL 实例自动关机，关机期间不触发，下次启动后将在下一个正常刻度恢复检测（并受默认 300 秒开机宽限保护），不会在开机瞬间抢跑。
 
 ## 状态与日志位置
 

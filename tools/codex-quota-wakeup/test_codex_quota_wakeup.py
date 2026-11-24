@@ -635,8 +635,20 @@ for line in sys.stdin:
             1800, codex_bin="/opt/my dir/codex%1", model_id="gpt-6-luna", custom_state_dir=Path("/tmp/st$1")
         )
         self.assertIn('"/opt/my dir/codex%%1"', svc)
+        self.assertIn("TimeoutStartSec=1320", svc)
+        self.assertIn("--min-uptime 300", svc)
         self.assertIn("CODEX_QUOTA_WAKEUP_STATE_DIR=/tmp/st$1", svc)
         self.assertIn("OnCalendar=*-*-* *:03,33:00", tmr)
+        self.assertNotIn("OnActiveSec=", tmr)
+        self.assertNotIn("OnStartupSec=", tmr)
+        self.assertNotIn("Persistent=true", tmr)
+
+        svc_odd, tmr_odd = mod.build_systemd_units(2700)
+        self.assertIn("--min-uptime 300", svc_odd)
+        self.assertIn("OnActiveSec=2700s", tmr_odd)
+        self.assertIn("OnUnitActiveSec=2700s", tmr_odd)
+        self.assertNotIn("OnStartupSec=", tmr_odd)
+        self.assertNotIn("Persistent=true", tmr_odd)
 
         with tempfile.TemporaryDirectory() as td:
             d = Path(td).resolve()
@@ -675,6 +687,64 @@ for line in sys.stdin:
             self.assertEqual(plist_file.read_bytes(), b"OLD_VALID_PLIST")
             self.assertEqual(sum(1 for c in calls if c[:2] == ["launchctl", "bootstrap"]), 5)
             self.assertTrue(any(c[:2] == ["launchctl", "enable"] for c in calls))
+            self.assertFalse(any(c[:2] == ["launchctl", "kickstart"] for c in calls))
+
+            # Successful macOS install loads plist (RunAtLoad=False, --min-uptime 300) and triggers kickstart
+            ok_calls = []
+            ok_out = io.StringIO()
+
+            def fake_run_ok(cmd, **kwargs):
+                ok_calls.append(list(cmd))
+                return DummyProc(0)
+
+            with mock.patch.object(mod, "launchd_plist_path", return_value=plist_file):
+                with mock.patch.object(mod.subprocess, "run", side_effect=fake_run_ok):
+                    with redirect_stdout(ok_out):
+                        rc_ok, _, _ = mod._install_macos(1800, st_dir, codex_bin=None)
+            self.assertEqual(rc_ok, 0)
+            domain_target = f"gui/{os.getuid()}/{mod.LAUNCHD_LABEL}"
+            self.assertIn(["launchctl", "kickstart", domain_target], ok_calls)
+            self.assertIn("min-uptime=300s", ok_out.getvalue())
+            self.assertNotIn("RunAtLoad=true", ok_out.getvalue())
+            written_pl = mod.plistlib.loads(plist_file.read_bytes())
+            self.assertIs(written_pl["RunAtLoad"], False)
+            self.assertIn("--min-uptime", written_pl["ProgramArguments"])
+            self.assertEqual(
+                written_pl["ProgramArguments"][written_pl["ProgramArguments"].index("--min-uptime") + 1],
+                "300",
+            )
+
+            # macOS `status` handles RunAtLoad=False, legacy RunAtLoad=True, and omitted RunAtLoad cleanly
+            for pl_override, expected_flag in (
+                (written_pl, "RunAtLoad=False"),
+                ({**written_pl, "RunAtLoad": True}, "RunAtLoad=True"),
+                ({k: v for k, v in written_pl.items() if k != "RunAtLoad"}, "RunAtLoad=False"),
+            ):
+                plist_file.write_bytes(mod.plistlib.dumps(pl_override, sort_keys=True))
+                st_out = io.StringIO()
+                with mock.patch.dict(os.environ, {"CODEX_QUOTA_WAKEUP_STATE_DIR": str(st_dir)}):
+                    with mock.patch.object(mod.platform, "system", return_value="Darwin"):
+                        with mock.patch.object(mod, "launchd_plist_path", return_value=plist_file):
+                            with mock.patch.object(mod.subprocess, "run", return_value=DummyProc(0)):
+                                with redirect_stdout(st_out):
+                                    rc_st_mac = mod.main(["status"])
+                self.assertEqual(rc_st_mac, 0)
+                self.assertIn(expected_flag, st_out.getvalue())
+
+            # Kickstart failure reports clearly and returns 1
+            err_kick = io.StringIO()
+
+            def fake_run_kick_fail(cmd, **kwargs):
+                if cmd[:2] == ["launchctl", "kickstart"]:
+                    return DummyProc(3, "No such process")
+                return DummyProc(0)
+
+            with mock.patch.object(mod, "launchd_plist_path", return_value=plist_file):
+                with mock.patch.object(mod.subprocess, "run", side_effect=fake_run_kick_fail):
+                    with redirect_stderr(err_kick):
+                        rc_kf, _, _ = mod._install_macos(1800, st_dir, codex_bin=None)
+            self.assertEqual(rc_kf, 1)
+            self.assertIn("launchctl kickstart failed", err_kick.getvalue())
 
     def test_ops_commands_install_uninstall_status_logs_rotation_lock_and_nvm_path(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -699,9 +769,18 @@ for line in sys.stdin:
             plist = mod.build_launchd_plist(1800, st_dir, codex_bin=str(fake_codex), offset_minute=18)
             self.assertIn(str(nvm_bin), plist["EnvironmentVariables"]["PATH"].split(":"))
             self.assertEqual(plist["StartCalendarInterval"], [{"Minute": 18}, {"Minute": 48}])
+            self.assertIs(plist["RunAtLoad"], False)
+            self.assertIn("--min-uptime", plist["ProgramArguments"])
+            self.assertEqual(
+                plist["ProgramArguments"][plist["ProgramArguments"].index("--min-uptime") + 1],
+                "300",
+            )
             svc_txt, tmr_txt = mod.build_systemd_units(1800, codex_bin=str(fake_codex), offset_minute=18)
             self.assertIn(str(nvm_bin), svc_txt)
+            self.assertIn("--min-uptime 300", svc_txt)
             self.assertIn("OnCalendar=*-*-* *:18,48:00", tmr_txt)
+            self.assertNotIn("OnStartupSec=", tmr_txt)
+            self.assertNotIn("Persistent=true", tmr_txt)
             with redirect_stderr(io.StringIO()):
                 self.assertEqual(mod.main(["install", "--minute-offset", "60"]), 2)
 
@@ -779,6 +858,7 @@ for line in sys.stdin:
                             rc_cron = mod.main(["install", "--codex-bin", str(fake_codex)])
                 self.assertEqual(rc_cron, 1)
                 self.assertIn("crontab -e", err_cron.getvalue())
+                self.assertIn("--min-uptime 300", err_cron.getvalue())
                 self.assertNotIn(sys.executable, err_cron.getvalue())
 
                 recorded_cmds = []
@@ -809,6 +889,8 @@ for line in sys.stdin:
                                         ["install", "--minute-offset", "18", "--codex-bin", str(fake_codex)]
                                     )
                 self.assertEqual(rc_inst, 0)
+                self.assertIn("min-uptime=300s", out_inst.getvalue())
+                self.assertNotIn("Persistent=true", out_inst.getvalue())
                 self.assertIn(["loginctl", "--no-ask-password", "enable-linger"], recorded_cmds)
                 self.assertTrue((xdg_dir / "systemd" / "user" / "codex-quota-wakeup.timer").is_file())
 
@@ -826,6 +908,24 @@ for line in sys.stdin:
                                 rc_st_linux = mod.main(["status"])
                 self.assertEqual(rc_st_linux, 0)
                 self.assertIn("schedule=hourly at :18,:48", out_st_linux.getvalue())
+
+                # Non-hour-dividing timer (`OnActiveSec=2700s` + `OnUnitActiveSec=2700s`) still parses cleanly in `status`
+                _, tmr_2700 = mod.build_systemd_units(2700)
+                (xdg_dir / "systemd" / "user" / "codex-quota-wakeup.timer").write_text(tmr_2700, encoding="utf-8")
+                out_st_odd = io.StringIO()
+                with mock.patch.object(mod.platform, "system", return_value="Linux"):
+                    with mock.patch.object(mod.shutil, "which", return_value="/usr/bin/systemctl"):
+                        with mock.patch.object(
+                            mod.subprocess,
+                            "run",
+                            side_effect=lambda cmd, **kw: DummyProc(
+                                0, out=("active\n" if "is-active" in cmd else "Linger=yes\n")
+                            ),
+                        ):
+                            with redirect_stdout(out_st_odd):
+                                rc_st_odd = mod.main(["status"])
+                self.assertEqual(rc_st_odd, 0)
+                self.assertIn("schedule=every 2700s", out_st_odd.getvalue())
 
                 # macOS `uninstall` clean unload removes plist
                 plist_path = d / "LaunchAgents" / f"{mod.LAUNCHD_LABEL}.plist"
@@ -967,6 +1067,176 @@ for line in sys.stdin:
                             json.loads(out4.getvalue())["pools"]["codex"]["reason"],
                             "weekly_wakeup_cap_reached",
                         )
+
+    def test_system_uptime_parsing_linux_and_macos(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            uptime_file = Path(td) / "uptime"
+            with mock.patch.object(mod.sys, "platform", "linux"):
+                with mock.patch.object(mod, "_PROC_UPTIME_PATH", str(uptime_file)):
+                    uptime_file.write_text("123.45 999.00\n", encoding="utf-8")
+                    self.assertAlmostEqual(mod.get_system_uptime_seconds(), 123.45, places=2)
+
+                    uptime_file.write_text("0.00 0.00\n", encoding="utf-8")
+                    self.assertEqual(mod.get_system_uptime_seconds(), 0.0)
+
+                    for bad in ("", "   \n", "-5.0 1.0\n", "nan 1.0\n", "inf 1.0\n", "notanumber 1.0\n"):
+                        uptime_file.write_text(bad, encoding="utf-8")
+                        self.assertIsNone(mod.get_system_uptime_seconds(), f"expected None for {bad!r}")
+
+                    uptime_file.unlink()
+                    self.assertIsNone(mod.get_system_uptime_seconds())
+
+        class DummyProc:
+            def __init__(self, rc: int, out: str = "") -> None:
+                self.returncode = rc
+                self.stdout = out
+                self.stderr = ""
+
+        with mock.patch.object(mod.sys, "platform", "darwin"):
+            with mock.patch.object(mod.time, "time", return_value=1795444191.913346):
+                sample = "{ sec = 1795444091, usec = 413346 } Mon Nov 23 22:28:11 2026\n"
+                with mock.patch.object(mod.shutil, "which", return_value=None):
+                    with mock.patch.object(mod.subprocess, "run", return_value=DummyProc(0, sample)) as mock_run:
+                        self.assertAlmostEqual(mod.get_system_uptime_seconds(), 100.5, places=3)
+                        self.assertEqual(mock_run.call_args[0][0], ["/usr/sbin/sysctl", "-n", "kern.boottime"])
+                        self.assertEqual(mock_run.call_args[1]["timeout"], 5)
+
+                with mock.patch.object(mod.shutil, "which", return_value="/custom/bin/sysctl"):
+                    with mock.patch.object(mod.subprocess, "run", return_value=DummyProc(0, sample)) as mock_run2:
+                        self.assertAlmostEqual(mod.get_system_uptime_seconds(), 100.5, places=3)
+                        self.assertEqual(mock_run2.call_args[0][0], ["/custom/bin/sysctl", "-n", "kern.boottime"])
+
+                # Without usec
+                with mock.patch.object(mod.subprocess, "run", return_value=DummyProc(0, "{ sec = 1795444091 }")):
+                    self.assertAlmostEqual(mod.get_system_uptime_seconds(), 100.913346, places=3)
+
+                # Clock rollback (boot_ts in future -> negative uptime) returns None
+                future = "{ sec = 1795445000, usec = 0 } Mon Nov 23 22:43:20 2026\n"
+                with mock.patch.object(mod.subprocess, "run", return_value=DummyProc(0, future)):
+                    self.assertIsNone(mod.get_system_uptime_seconds())
+
+                # Error exit / malformed output / exception all degrade to None
+                for bad_proc in (
+                    DummyProc(1, sample),
+                    DummyProc(0, "unexpected format"),
+                    DummyProc(0, "{ sec = 0, usec = 0 }"),
+                    DummyProc(0, "{ sec = 1795444091, usec = 1500000 }"),
+                ):
+                    with mock.patch.object(mod.subprocess, "run", return_value=bad_proc):
+                        self.assertIsNone(mod.get_system_uptime_seconds())
+
+                with mock.patch.object(
+                    mod.subprocess, "run", side_effect=subprocess.TimeoutExpired(["sysctl"], 5)
+                ):
+                    self.assertIsNone(mod.get_system_uptime_seconds())
+
+        with mock.patch.object(mod.sys, "platform", "win32"):
+            self.assertIsNone(mod.get_system_uptime_seconds())
+
+    def test_wait_for_min_uptime_branches_and_run_ordering_and_version_timeout(self) -> None:
+        # 1) min_uptime <= 0 skips reading OS uptime and sleeping
+        with mock.patch.object(mod, "get_system_uptime_seconds") as mock_up:
+            with mock.patch.object(mod.time, "sleep") as mock_sleep:
+                self.assertEqual(mod.wait_for_min_uptime(0), 0.0)
+                self.assertEqual(mod.wait_for_min_uptime(-5), 0.0)
+        mock_up.assert_not_called()
+        mock_sleep.assert_not_called()
+
+        # 2) Uptime below threshold sleeps remaining seconds and logs to stderr unless quiet
+        err_buf = io.StringIO()
+        with mock.patch.object(mod, "get_system_uptime_seconds", return_value=42.5):
+            with mock.patch.object(mod.time, "sleep") as mock_sleep:
+                with redirect_stderr(err_buf):
+                    slept = mod.wait_for_min_uptime(300, quiet=False)
+        self.assertAlmostEqual(slept, 257.5, places=3)
+        mock_sleep.assert_called_once_with(257.5)
+        self.assertIn("waiting 257.5s", err_buf.getvalue())
+
+        err_quiet = io.StringIO()
+        with mock.patch.object(mod, "get_system_uptime_seconds", return_value=100.0):
+            with mock.patch.object(mod.time, "sleep") as mock_sleep_q:
+                with redirect_stderr(err_quiet):
+                    slept_q = mod.wait_for_min_uptime(300, quiet=True)
+        self.assertAlmostEqual(slept_q, 200.0, places=3)
+        mock_sleep_q.assert_called_once_with(200.0)
+        self.assertEqual(err_quiet.getvalue(), "")
+
+        # 3) Uptime >= threshold or unreadable (None) does not sleep
+        for val in (300.0, 999.0, None):
+            with mock.patch.object(mod, "get_system_uptime_seconds", return_value=val):
+                with mock.patch.object(mod.time, "sleep") as mock_sleep_no:
+                    self.assertEqual(mod.wait_for_min_uptime(300), 0.0)
+            mock_sleep_no.assert_not_called()
+
+        # 4) --min-uptime bounds validation returns exit code 2
+        with redirect_stderr(io.StringIO()):
+            self.assertEqual(mod.main(["run", "--min-uptime", "-1"]), 2)
+            self.assertEqual(mod.main(["run", "--min-uptime", "3601"]), 2)
+
+        # 5) ensure_min_codex_version uses VERSION_CHECK_TIMEOUT_SECONDS (45s)
+        self.assertEqual(mod.VERSION_CHECK_TIMEOUT_SECONDS, 45)
+        captured_timeout = []
+
+        def fake_ver_run(cmd, **kwargs):
+            captured_timeout.append(kwargs.get("timeout"))
+            return subprocess.CompletedProcess(cmd, 0, "codex-cli 0.170.0\n", "")
+
+        with mock.patch.object(mod.subprocess, "run", side_effect=fake_ver_run):
+            mod.ensure_min_codex_version("/usr/bin/codex", {"PATH": "/usr/bin"})
+        self.assertEqual(captured_timeout, [45])
+
+        # 6) execute_run invokes wait_for_min_uptime BEFORE flock, version check, and duration_ms timer
+        with tempfile.TemporaryDirectory() as td:
+            d = Path(td).resolve()
+            st_dir = d / "state"
+            fake_codex = d / "codex"
+            fake_codex.write_text("#!/bin/sh\necho 'codex-cli 0.170.0'\n", encoding="utf-8")
+            fake_codex.chmod(0o755)
+
+            events = []
+            mono_clock = [1000.0]
+
+            def fake_monotonic():
+                return mono_clock[0]
+
+            def fake_wait(min_s, quiet=False):
+                events.append(("wait", min_s, quiet))
+                # Simulate a 120s boot-grace sleep before execution timer starts
+                mono_clock[0] += 120.0
+                return 120.0
+
+            orig_flock = mod.fcntl.flock
+
+            def spy_flock(fd, op):
+                events.append(("flock",))
+                return orig_flock(fd, op)
+
+            def spy_version(cbin, env):
+                events.append(("version",))
+                mono_clock[0] += 0.25
+
+            active_bundle = _make_drifting_bundle(
+                int(dt.datetime.now(dt.timezone.utc).timestamp()) + mod.WEEK_SECONDS, used_pct=12
+            )
+            out_buf = io.StringIO()
+            with mock.patch.dict(os.environ, {"CODEX_QUOTA_WAKEUP_STATE_DIR": str(st_dir)}):
+                with mock.patch.object(mod.time, "monotonic", side_effect=fake_monotonic):
+                    with mock.patch.object(mod, "wait_for_min_uptime", side_effect=fake_wait):
+                        with mock.patch.object(mod.fcntl, "flock", side_effect=spy_flock):
+                            with mock.patch.object(mod, "ensure_min_codex_version", side_effect=spy_version):
+                                with mock.patch.object(
+                                    mod, "fetch_quota_with_retries", return_value=(active_bundle, 1)
+                                ):
+                                    with redirect_stdout(out_buf):
+                                        rc = mod.main(
+                                            ["run", "--min-uptime", "300", "--codex-bin", str(fake_codex)]
+                                        )
+            self.assertEqual(rc, 0)
+            self.assertEqual([e[0] for e in events], ["wait", "flock", "version"])
+            self.assertEqual(events[0], ("wait", 300, False))
+            rec = json.loads(out_buf.getvalue().strip())
+            self.assertEqual(rec["status"], "ok")
+            self.assertEqual(rec["duration_ms"], 250)
 
 
 if __name__ == "__main__":

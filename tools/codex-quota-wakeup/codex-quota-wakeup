@@ -45,6 +45,9 @@ LAUNCHD_LABEL = f"local.{APP_NAME}"
 SYSTEMD_UNIT_BASE = APP_NAME
 DEFAULT_INTERVAL_SECONDS = 1800  # 30m -> runs at :03 and :33 past every hour
 CALENDAR_MINUTE_OFFSET = 3
+DEFAULT_SCHEDULED_MIN_UPTIME_SECONDS = 300
+MAX_MIN_UPTIME_SECONDS = 3600
+VERSION_CHECK_TIMEOUT_SECONDS = 45
 MAX_LOG_BYTES = 2 * 1024 * 1024  # 2 MiB per log file, keep 1 rotated backup
 WEEK_SECONDS = 7 * 86400
 WEEK_MINUTES = 7 * 24 * 60  # 10080
@@ -105,6 +108,9 @@ PROXY_CONFIG_FILENAME = "proxy.json"
 # --ignore-user-config --ignore-rules`.
 MIN_CODEX_VERSION = (0, 158, 0)
 VERSION_TRIPLE_RE = re.compile(r"\b(\d+)\.(\d+)\.(\d+)\b")
+SYSCTL_BOOTTIME_SEC_RE = re.compile(r"\bsec\s*=\s*(-?\d+)\b")
+SYSCTL_BOOTTIME_USEC_RE = re.compile(r"\busec\s*=\s*(\d+)\b")
+_PROC_UPTIME_PATH = "/proc/uptime"
 
 PROTOCOL_EVENT_TYPES = {
     "thread.started",
@@ -533,7 +539,7 @@ def ensure_min_codex_version(codex_bin: str, env: Dict[str, str]) -> None:
             text=True,
             encoding="utf-8",
             errors="replace",
-            timeout=10,
+            timeout=VERSION_CHECK_TIMEOUT_SECONDS,
         )
     except Exception as exc:
         raise RuntimeError(f"Failed to verify `codex --version` (need >= {min_str}): {exc}") from exc
@@ -1381,7 +1387,74 @@ def parse_retry_delays_arg(raw: str) -> List[float]:
     return delays
 
 
+def get_system_uptime_seconds() -> Optional[float]:
+    """Return current OS uptime in seconds, or None if unavailable/unparseable."""
+    try:
+        if sys.platform.startswith("linux"):
+            with open(_PROC_UPTIME_PATH, "r", encoding="utf-8") as f:
+                parts = f.read().split()
+            if not parts:
+                return None
+            val = float(parts[0])
+            return val if (math.isfinite(val) and val >= 0.0) else None
+        if sys.platform == "darwin":
+            sysctl_bin = shutil.which("sysctl") or "/usr/sbin/sysctl"
+            proc = subprocess.run(
+                [sysctl_bin, "-n", "kern.boottime"],
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            if proc.returncode != 0:
+                return None
+            out = proc.stdout or ""
+            m_sec = SYSCTL_BOOTTIME_SEC_RE.search(out)
+            if not m_sec:
+                return None
+            sec = int(m_sec.group(1))
+            if sec <= 0:
+                return None
+            m_usec = SYSCTL_BOOTTIME_USEC_RE.search(out)
+            usec = int(m_usec.group(1)) if m_usec else 0
+            if not (0 <= usec < 1_000_000):
+                return None
+            boot_ts = float(sec) + (float(usec) / 1_000_000.0)
+            uptime = time.time() - boot_ts
+            return uptime if (math.isfinite(uptime) and uptime >= 0.0) else None
+    except Exception:
+        return None
+    return None
+
+
+def wait_for_min_uptime(min_uptime_s: int, quiet: bool = False) -> float:
+    """Wait until OS uptime reaches `min_uptime_s`; return seconds slept (0.0 if no wait)."""
+    if min_uptime_s <= 0:
+        return 0.0
+    uptime = get_system_uptime_seconds()
+    if uptime is None or uptime >= float(min_uptime_s):
+        return 0.0
+    remaining = min(float(min_uptime_s), float(min_uptime_s) - uptime)
+    if remaining <= 0.0:
+        return 0.0
+    if not quiet:
+        print(
+            f"{APP_NAME}: system uptime {uptime:.1f}s < {min_uptime_s}s; waiting {remaining:.1f}s before check",
+            file=sys.stderr,
+        )
+    time.sleep(remaining)
+    return remaining
+
+
 def execute_run(args: argparse.Namespace) -> int:
+    raw_min_uptime = getattr(args, "min_uptime", 0)
+    min_uptime = 0 if raw_min_uptime is None else int(raw_min_uptime)
+    if not (0 <= min_uptime <= MAX_MIN_UPTIME_SECONDS):
+        print(f"--min-uptime must be between 0 and {MAX_MIN_UPTIME_SECONDS} seconds.", file=sys.stderr)
+        return 2
+
+    wait_for_min_uptime(min_uptime, quiet=bool(args.quiet))
+
     start_mono = time.monotonic()
     started_at = now_local()
     state_dir = default_state_dir()
@@ -1903,6 +1976,8 @@ def build_launchd_plist(
         preferred_self_executable(),
         "run",
         "--quiet",
+        "--min-uptime",
+        str(DEFAULT_SCHEDULED_MIN_UPTIME_SECONDS),
     ]
     if codex_bin:
         prog_args += ["--codex-bin", codex_bin]
@@ -1923,7 +1998,7 @@ def build_launchd_plist(
         "Label": LAUNCHD_LABEL,
         "ProcessType": "Background",
         "ProgramArguments": prog_args,
-        "RunAtLoad": True,
+        "RunAtLoad": False,
         "EnvironmentVariables": env_vars,
         "StandardErrorPath": str(state_dir / "launchd-stderr.log"),
     }
@@ -2002,24 +2077,22 @@ def build_systemd_units(
         "Description=Codex weekly quota reset detector and wakeup tool\n\n"
         "[Service]\n"
         "Type=oneshot\n"
-        "TimeoutStartSec=960\n"
+        "TimeoutStartSec=1320\n"
         "Nice=19\n"
         f"{env_block}\n"
-        f"ExecStart={exe} run --quiet{extra}\n"
+        f"ExecStart={exe} run --quiet --min-uptime {DEFAULT_SCHEDULED_MIN_UPTIME_SECONDS}{extra}\n"
     )
     mins = calendar_minutes_for_interval(interval, offset_minute=offset_minute)
     if mins:
         min_spec = ",".join(f"{m:02d}" for m in mins)
         trigger_line = f"OnCalendar=*-*-* *:{min_spec}:00\n"
     else:
-        trigger_line = f"OnUnitActiveSec={int(interval)}s\n"
+        trigger_line = f"OnActiveSec={int(interval)}s\nOnUnitActiveSec={int(interval)}s\n"
     timer_text = (
         "[Unit]\n"
         "Description=Periodic check to wake up reset Codex weekly quota windows\n\n"
         "[Timer]\n"
-        "OnStartupSec=45s\n"
-        f"{trigger_line}"
-        "Persistent=true\n\n"
+        f"{trigger_line}\n"
         "[Install]\n"
         "WantedBy=timers.target\n"
     )
@@ -2238,9 +2311,21 @@ def _install_macos(
         print(f"launchctl bootstrap failed ({boot.returncode}): {detail}", file=sys.stderr)
         return 1, {}, False
 
+    kick = _run_scheduler_cmd(["launchctl", "kickstart", domain_target])
+    if kick.returncode != 0:
+        detail = (kick.stderr or kick.stdout or "").strip() or f"exit code {kick.returncode}"
+        print(
+            f"LaunchAgent {LAUNCHD_LABEL} loaded, but launchctl kickstart failed ({kick.returncode}): {detail}",
+            file=sys.stderr,
+        )
+        return 1, saved_proxy, cleared_proxy
+
     print(f"Installed and loaded LaunchAgent {LAUNCHD_LABEL}")
     print(f"  Plist:    {plist_path}")
-    print(f"  Schedule: {describe_schedule(interval, offset_minute=offset_minute)} (and RunAtLoad=true)")
+    print(
+        f"  Schedule: {describe_schedule(interval, offset_minute=offset_minute)} "
+        f"(min-uptime={DEFAULT_SCHEDULED_MIN_UPTIME_SECONDS}s)"
+    )
     if model_id:
         print(f"  Model:    {model_id}")
     print(f"  Log:      {state_dir / 'wakeup.jsonl'}")
@@ -2288,7 +2373,9 @@ def _install_linux(
         fallback_mins = calendar_minutes_for_interval(DEFAULT_INTERVAL_SECONDS, offset_minute=offset_minute) or [3, 33]
         cron_min = ",".join(str(m) for m in (mins or fallback_mins))
         cron_note = "" if mins else " (default 30m schedule example; adjust cron fields if needed)"
-        cron_cmd = f"{env_prefix}{exe} run --quiet{extra}".replace("%", "\\%")
+        cron_cmd = (
+            f"{env_prefix}{exe} run --quiet --min-uptime {DEFAULT_SCHEDULED_MIN_UPTIME_SECONDS}{extra}"
+        ).replace("%", "\\%")
         print(
             f"systemd --user is not active in this Linux environment ({reason}).\n"
             "Skipped writing scheduler units to avoid touching system/cron files.\n"
@@ -2345,7 +2432,10 @@ def _install_linux(
     print(f"Installed and enabled user timer {SYSTEMD_UNIT_BASE}.timer")
     print(f"  Service:  {service_path}")
     print(f"  Timer:    {timer_path}")
-    print(f"  Schedule: {describe_schedule(interval, offset_minute=offset_minute)} (Persistent=true)")
+    print(
+        f"  Schedule: {describe_schedule(interval, offset_minute=offset_minute)} "
+        f"(min-uptime={DEFAULT_SCHEDULED_MIN_UPTIME_SECONDS}s)"
+    )
     if linger_note:
         print(f"  Linger:   {linger_note}")
     if model_id:
@@ -2656,7 +2746,7 @@ def execute_status(args: argparse.Namespace) -> int:
                     sched_str = f"every {pl.get('StartInterval')}s"
                 else:
                     sched_str = "custom"
-                interval_info = f", schedule={sched_str}, RunAtLoad={pl.get('RunAtLoad')}"
+                interval_info = f", schedule={sched_str}, RunAtLoad={bool(pl.get('RunAtLoad', False))}"
             except Exception:
                 pass
         print(
@@ -2762,6 +2852,15 @@ def build_parser() -> argparse.ArgumentParser:
         type=parse_retry_delays_arg,
         default="5,15",
         help="Comma-separated retry backoff seconds for quota reads on transient startup/wake network errors (default: 5,15)",
+    )
+    p_run.add_argument(
+        "--min-uptime",
+        type=int,
+        default=0,
+        help=(
+            f"Wait until system uptime reaches at least this many seconds before checking "
+            f"(0-{MAX_MIN_UPTIME_SECONDS}, default: 0; scheduled jobs pass {DEFAULT_SCHEDULED_MIN_UPTIME_SECONDS})"
+        ),
     )
 
     p_inst = sub.add_parser("install", help="Install user-level periodic task (macOS LaunchAgent / Linux systemd --user timer)")

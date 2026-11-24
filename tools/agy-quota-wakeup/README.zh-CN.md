@@ -10,13 +10,13 @@ AGY 的周额度窗口（`gemini-weekly` 与 `3p-weekly` 两套独立池）在�
 
 ## 工作方式
 
-1. **平时零消耗探测**：默认每半小时在 `:03`、`:33`（及开机登录 / 休眠唤醒补跑时）执行 `agy --output-format json -p=/usage`（0 Token、不创建会话），检查两个周额度桶：
+1. **平时零消耗探测**：默认每半小时在 `:03`、`:33` 执行 `agy --output-format json -p=/usage`（0 Token、不创建会话），检查两个周额度桶；系统重启后不立即抢跑，而是自然顺延到下一个计划刻度，并由后台默认 `--min-uptime 300` 在开机前 5 分钟内自动宽限等待：
    - **已激活**：`remaining_fraction < 1`，或 `reset_time` 距当前已不足 `7天 - 5分钟`；直接记日志退出，零消耗。
    - **未激活**：`remaining_fraction == 1` 且 `reset_time` 仍随当前时刻贴着 `now + 7天` 漂移。
 2. **最小 Chat-only 唤醒（带标准非 yolo 回退）**：仅当某池未激活时，优先在空临时目录内动态写入自包含的零工具配置（`.agents/agents/quota-wakeup.md`：`tools: []`、`inheritCustomizations: false`、`excludeDefaultComponents: true`），向目标池低思考深度模型发送一条单字 `OK` 请求（Gemini 池约 370 tokens，第三方池约 820 tokens、仅占周池约 `0.004%`）；若未来某版 `agy` 在发送前拒绝自定义配置或可选参数，自动回退到最精简的标准非 yolo 命令（`agy --model <id> --output-format json -p=...`，日志记录 `mode: "standard_fallback"`），随后复查 `/usage` 确认 7 天倒计时已锁定。
 3. **跨代与跨平台免维护**：
    - 模型 ID 从 `agy models` 动态挑选最新一代 `Flash Low` / `Claude Sonnet Low`，后续模型换代无需改版本号；
-   - macOS 使用用户级 `~/Library/LaunchAgents`（`launchd` `StartCalendarInterval`），Linux 使用用户级 `~/.config/systemd/user/`（`systemd --user` timer + `Persistent=true`），休眠唤醒后错过刻度自动合并补跑一次，不触碰系统级目录或 root 权限。
+   - macOS 使用用户级 `~/Library/LaunchAgents`（`launchd` `StartCalendarInterval`、`RunAtLoad=false`），Linux 使用用户级 `~/.config/systemd/user/`（`systemd --user` timer `OnCalendar`，不设 `OnStartupSec` / `Persistent=true`），不触碰系统级目录或 root 权限。`install` 完成后会立即后台执行一次首跑；系统重启后不抢跑，顺延到下一个正常刻度，并配合默认 `--min-uptime 300` 兜底等待网络与本地服务就绪。
 
 ## 安全与防刷护栏
 
@@ -35,7 +35,7 @@ mkdir -p ~/.local/bin && cp agy-quota-wakeup ~/.local/bin/
 ```
 
 > - `install` 会把当前脚本路径写入系统定时任务，请先放到 `~/.local/bin` 等固定目录再安装，避免直接从 `~/Downloads`、`~/Desktop`、`~/Documents` 等受系统隐私保护或易删目录安装。若提示 `command not found`，将 `~/.local/bin` 加入 `PATH` 或使用完整路径调用。
-> - 修改参数、脚本路径或代理设置后，直接重跑 `install` 即可幂等覆盖更新（无需先 `uninstall`；重装时请带齐需保留的可选参数）。
+> - 修改参数、脚本路径、代理设置或升级脚本后，请带上原安装参数直接重跑一次 `install`，即可幂等刷新已有的 LaunchAgent / systemd 定时配置（无需先 `uninstall`；手工配置 `crontab` 的用户请在对应命令中补上 `--min-uptime 300`）。
 > - 同一账号通常在一台主力设备启用即可；若需在多台设备（如 macOS + Linux）并行守护，可在一端加 `--minute-offset 18` 错开触发分钟（`:18` / `:48`），避免同刻度重复探测。
 
 运行测试：
@@ -80,6 +80,7 @@ agy-quota-wakeup logs --json -n 20
 | `run` | `--dry-run` / `--force` | 只检不发 / 强制对目标池发一次最小唤醒 |
 | `run` | `--gemini-model` / `--3p-model` | 手动覆盖对应额度池的唤醒模型 ID |
 | `run` | `--retry-delays LIST` | `/usage` 瞬态网络错误重试间隔秒数列表（默认 `5,15`） |
+| `run` | `--min-uptime SECONDS` | 检测前等待系统开机时长达到该秒数（`0-3600`，默认 `0` 不等待；后台定时任务默认传 `300`） |
 | 环境变量 | `AGY_QUOTA_WAKEUP_STATE_DIR` | 覆盖状态与日志目录（安装后手动跑其他子命令需保持一致） |
 
 更多选项可运行 `agy-quota-wakeup --help` 或 `agy-quota-wakeup <subcommand> --help`。
@@ -87,7 +88,7 @@ agy-quota-wakeup logs --json -n 20
 ## 网络代理与 Linux / WSL2 说明
 
 - **代理自动继承**：`install` 时会自动捕获当前终端的 `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY` / `NO_PROXY`（大小写均兼容；仅设 `ALL_PROXY` / `all_proxy` 时自动补齐 `HTTP(S)_PROXY` 映射），以 `0600` 权限保存在 `proxy.json` 供后台定时任务继承（运行时若当前进程已显式设置代理则优先使用现场值）。更换或关闭代理后重跑一次 `agy-quota-wakeup install`（或加 `--no-proxy` 清除已存代理）即可刷新；`install` 完成后会立即后台执行一次首跑检查。
-- **Linux / WSL2 与 SSH 常驻**：本机 `systemctl --user` 可用时直接运行 `install` 即可，且会自动调用 `loginctl enable-linger` 让用户定时器在退出全部 SSH 会话后继续常驻（若受系统权限限制会打印对应 `sudo` 命令；unit 级异常可用 `journalctl --user -u agy-quota-wakeup` 排查）。若环境未启用 `systemd --user`，命令会安全退出并打印默认每半小时（`:03,:33`）的 `crontab -e` 示例（手工添加的 `cron` 条目停用时需自行移除）。注意 `linger` 不会阻止 Windows 将空闲 WSL 实例自动关机，关机期间不触发，下次启动后 `Persistent=true` 会自动补跑。
+- **Linux / WSL2 与 SSH 常驻**：本机 `systemctl --user` 可用时直接运行 `install` 即可，且会自动调用 `loginctl enable-linger` 让用户定时器在退出全部 SSH 会话后继续常驻（若受系统权限限制会打印对应 `sudo` 命令；unit 级异常可用 `journalctl --user -u agy-quota-wakeup` 排查）。若环境未启用 `systemd --user`，命令会安全退出并打印默认每半小时（`:03,:33`、含 `--min-uptime 300`）的 `crontab -e` 示例（手工添加的 `cron` 条目停用时需自行移除）。注意 `linger` 不会阻止 Windows 将空闲 WSL 实例自动关机，关机期间不触发，下次启动后将在下一个正常刻度恢复检测（并受默认 300 秒开机宽限保护），不会在开机瞬间抢跑。
 
 ## 状态与日志位置
 

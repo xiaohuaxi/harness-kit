@@ -10,13 +10,13 @@ Antigravity's weekly quota windows (`gemini-weekly` and `3p-weekly`, two indepen
 
 ## How It Works
 
-1. **Zero-Token Polling**: Runs every 30 minutes by default at `:03` and `:33` (plus catch-up on login / wake from sleep) via `agy --output-format json -p=/usage` (0 tokens, no session created) to inspect both weekly quota buckets:
+1. **Zero-Token Polling**: Runs every 30 minutes by default at `:03` and `:33` (skipping immediate post-reboot bursts and waiting until system uptime reaches 300s via `--min-uptime 300`) via `agy --output-format json -p=/usage` (0 tokens, no session created) to inspect both weekly quota buckets:
    - **Active**: `remaining_fraction < 1`, or `reset_time` is less than `7 days - 5 minutes` away—logs the check and exits with zero token usage.
    - **Unactivated**: `remaining_fraction == 1` and `reset_time` is still drifting forward alongside `now + 7 days`.
 2. **Minimal Chat-Only Wakeup (with Standard Non-YOLO Fallback)**: Only when a pool is unactivated, writes a self-contained zero-tool custom agent (`.agents/agents/quota-wakeup.md` with `tools: []`, `inheritCustomizations: false`, `excludeDefaultComponents: true`) inside an empty temporary directory and sends a single-word `OK` prompt to that pool's low-thinking model (~370 tokens for Gemini, ~820 tokens for 3P—around `0.004%` of a weekly pool). If a future `agy` release rejects custom agent flags before sending, it falls back cleanly to a minimal standard non-YOLO invocation (`agy --model <id> --output-format json -p=...`, logged as `mode: "standard_fallback"`), then re-checks `/usage` to confirm the 7-day countdown is locked.
 3. **Zero-Maintenance Across Model Generations & Platforms**:
    - Dynamically selects the latest `Flash Low` / `Claude Sonnet Low` model ID from `agy models`, so model upgrades require no manual edits.
-   - Uses user-level `~/Library/LaunchAgents` (`launchd` `StartCalendarInterval`) on macOS and `~/.config/systemd/user/` (`systemd --user` timer with `Persistent=true`) on Linux—missed ticks after sleep coalesce into a single catch-up run without touching system directories or root privileges.
+   - Uses user-level `~/Library/LaunchAgents` (`launchd` `StartCalendarInterval`, `RunAtLoad=false`) on macOS and `~/.config/systemd/user/` (`systemd --user` timer with `OnCalendar`, without `OnStartupSec` or `Persistent=true`) on Linux—without touching system directories or root privileges. `install` triggers one immediate initial check, while subsequent system reboots naturally defer to the next scheduled tick with a 5-minute boot grace guard (`--min-uptime 300`) so checks wait for networking and local services to settle.
 
 ## Safety & Anti-Loop Guardrails
 
@@ -35,7 +35,7 @@ mkdir -p ~/.local/bin && cp agy-quota-wakeup ~/.local/bin/
 ```
 
 > - `install` writes the script's current path into the OS scheduler. Copy it to a stable directory such as `~/.local/bin` first—avoid installing directly from `~/Downloads`, `~/Desktop`, or `~/Documents`. If `agy-quota-wakeup` is not found in your shell, add `~/.local/bin` to `PATH` or invoke it by full path.
-> - To change options, script path, or proxy settings, re-run `install` directly to update idempotently (no need to `uninstall` first; pass all optional flags you want to keep).
+> - To change options, script path, or proxy settings—or after upgrading the script—re-run `install` directly with your original flags to refresh the existing LaunchAgent / systemd timer configuration idempotently (no need to `uninstall` first; if you configured `crontab` manually, add `--min-uptime 300` to the cron command).
 > - Enabling it on one primary machine per account is usually enough. If you run it on multiple machines (e.g. macOS + Linux), add `--minute-offset 18` on one machine (`:18` / `:48`) to avoid duplicate probes at the exact same minute.
 
 Run unit tests:
@@ -80,6 +80,7 @@ agy-quota-wakeup logs --json -n 20
 | `run` | `--dry-run` / `--force` | Check only without sending / force one minimal wakeup on target pool(s) |
 | `run` | `--gemini-model` / `--3p-model` | Override the wakeup model ID for the corresponding pool |
 | `run` | `--retry-delays LIST` | Retry delay list in seconds for transient `/usage` network errors (default `5,15`) |
+| `run` | `--min-uptime SECONDS` | Wait until OS uptime reaches this threshold before checking (`0-3600`, default `0`; scheduled jobs pass `300`) |
 | Env var | `AGY_QUOTA_WAKEUP_STATE_DIR` | Override the state and log directory (keep consistent across subcommands after install) |
 
 Run `agy-quota-wakeup --help` or `agy-quota-wakeup <subcommand> --help` for full details.
@@ -87,7 +88,7 @@ Run `agy-quota-wakeup --help` or `agy-quota-wakeup <subcommand> --help` for full
 ## Proxy Inheritance & Linux / WSL2 Notes
 
 - **Automatic Proxy Inheritance**: `install` captures `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, and `NO_PROXY` from the current shell (case-insensitive; automatically populates `HTTP(S)_PROXY` when only `ALL_PROXY` / `all_proxy` is set) and stores them in `proxy.json` with mode `0600` for background runs (explicit proxy env vars in a foreground run take precedence). Re-run `agy-quota-wakeup install` (or pass `--no-proxy` to clear) whenever your proxy changes; `install` also triggers an initial background check immediately.
-- **Linux / WSL2 & SSH Persistence**: Where `systemctl --user` is available, `install` configures the user timer and automatically runs `loginctl enable-linger` so timers stay active after all SSH sessions disconnect (prints the corresponding `sudo` command if restricted; inspect unit-level issues with `journalctl --user -u agy-quota-wakeup`). If `systemd --user` is unavailable, `install` exits safely and prints a ready-to-use `crontab -e` example (`:03,:33`; manually remove cron entries when uninstalling). Note that `linger` does not prevent Windows from auto-shutting down idle WSL instances; missed ticks catch up once the instance starts again (`Persistent=true`).
+- **Linux / WSL2 & SSH Persistence**: Where `systemctl --user` is available, `install` configures the user timer and automatically runs `loginctl enable-linger` so timers stay active after all SSH sessions disconnect (prints the corresponding `sudo` command if restricted; inspect unit-level issues with `journalctl --user -u agy-quota-wakeup`). If `systemd --user` is unavailable, `install` exits safely and prints a ready-to-use `crontab -e` example (`:03,:33` with `--min-uptime 300`; manually remove cron entries when uninstalling). Note that `linger` does not prevent Windows from auto-shutting down idle WSL instances; once the instance starts again, checks resume at the next scheduled tick (with the 300s boot grace period) rather than bursting immediately on startup.
 
 ## State & Log Files
 
