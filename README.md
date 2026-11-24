@@ -16,6 +16,7 @@ Standalone CLI tools, hooks, agent-executable guides, and reusable building bloc
 | --- | --- | --- | --- |
 | **Tools** | `agy-quota-wakeup` | Zero-token polling & minimal chat-only weekly quota wakeup daemon (`launchd` / `systemd --user`) for Antigravity (`gemini-weekly` & `3p-weekly`). | [`tools/agy-quota-wakeup/README.md`](tools/agy-quota-wakeup/README.md) |
 | **Tools** | `agy-statusline` | Soft 256-color, 7-segment `statusLine` command for Antigravity CLI (`agy`) with transcript `CHECKPOINT` fallback and atomic quota cache persistence. | [`tools/agy-statusline/README.md`](tools/agy-statusline/README.md) |
+| **Tools** | `claude-statusline` | Soft 256-color, 7-segment `statusLine` command for Claude Code with graceful API-key / third-party fallback and opt-in quota history logging. | [`tools/claude-statusline/README.md`](tools/claude-statusline/README.md) |
 | **Tools** | `codex-quota-wakeup` | Zero-token polling & isolated minimal read-only weekly quota wakeup daemon (`launchd` / `systemd --user`) for Codex CLI ChatGPT subscriptions. | [`tools/codex-quota-wakeup/README.md`](tools/codex-quota-wakeup/README.md) |
 | **Hooks** | `codex-depth-guard` | Fail-closed `PreToolUse` recursion depth guard hook for Codex CLI multi-agent (`multi_agent_v2`), capping `spawn_agent` nesting depth with authoritative transcript checks. | [`hooks/codex-depth-guard/README.md`](hooks/codex-depth-guard/README.md) |
 | **Guides** | `google-ai-perks` | Agent-executable guide to inspect, claim, configure, and verify Google AI Pro / Ultra subscription perks (Cloud credits, Colab GPU CU, Flow, Drive, YouTube, etc.). | [`guides/google-ai-perks/README.md`](guides/google-ai-perks/README.md) |
@@ -77,7 +78,29 @@ chmod +x ~/.gemini/antigravity-cli/agy-statusline
 
 Path aliases (`AGY_STATUSLINE_PATH_ALIASES`), opt-in quota history logging (`AGY_STATUSLINE_QUOTA_LOG`), and state file details are documented in [`tools/agy-statusline/README.md`](tools/agy-statusline/README.md).
 
-### 3. Codex Multi-Agent Depth Guard Hook (`hooks/codex-depth-guard`)
+### 3. Claude Code Status Line (`tools/claude-statusline`)
+
+Copy the script (requires Bash 3.2+ and Python 3.7+; `git` is optional) into `${CLAUDE_CONFIG_DIR:-$HOME/.claude}` and enable `statusLine` in `~/.claude/settings.json` (or `${CLAUDE_CONFIG_DIR}/settings.json`):
+
+```bash
+CLAUDE_DIR="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
+mkdir -p "$CLAUDE_DIR"
+cp tools/claude-statusline/claude-statusline "$CLAUDE_DIR/claude-statusline"
+chmod +x "$CLAUDE_DIR/claude-statusline"
+```
+
+```json
+{
+  "statusLine": {
+    "type": "command",
+    "command": "bash \"${CLAUDE_CONFIG_DIR:-$HOME/.claude}/claude-statusline\""
+  }
+}
+```
+
+Path aliases (`CLAUDE_STATUSLINE_PATH_ALIASES`), opt-in quota history logging (`CLAUDE_STATUSLINE_QUOTA_LOG`), and state directory details (`CLAUDE_STATUSLINE_STATE_DIR`) are documented in [`tools/claude-statusline/README.md`](tools/claude-statusline/README.md).
+
+### 4. Codex Multi-Agent Depth Guard Hook (`hooks/codex-depth-guard`)
 
 Copy the hook script (requires Python 3.8+ and a Codex CLI release supporting `PreToolUse` hooks) and wire it into `${CODEX_HOME:-$HOME/.codex}/config.toml` (default: `~/.codex/config.toml`):
 
@@ -104,7 +127,7 @@ timeout = 10
 
 Depth hierarchy (`CODEX_MAX_CALLER_DEPTH`, default `1` for 3 levels total) and fail-closed boundary details are documented in [`hooks/codex-depth-guard/README.md`](hooks/codex-depth-guard/README.md).
 
-### 4. Agent Guides (`guides/google-ai-perks`)
+### 5. Agent Guides (`guides/google-ai-perks`)
 
 Point your AI agent (Antigravity / Claude Code / Codex) to [`guides/google-ai-perks/google-ai-perks-agent-guide.md`](guides/google-ai-perks/google-ai-perks-agent-guide.md) and ask it to inspect, claim, configure, and verify your Google AI subscription perks. See [`guides/google-ai-perks/README.md`](guides/google-ai-perks/README.md) for details.
 
@@ -117,6 +140,7 @@ Each tool and hook includes standalone unit tests using Python's built-in `unitt
 ```bash
 python3 tools/agy-quota-wakeup/test_agy_quota_wakeup.py -v
 python3 tools/agy-statusline/test_agy_statusline.py -v
+python3 tools/claude-statusline/test_claude_statusline.py -v
 python3 tools/codex-quota-wakeup/test_codex_quota_wakeup.py -v
 python3 hooks/codex-depth-guard/test_codex_depth_guard.py -v
 ```

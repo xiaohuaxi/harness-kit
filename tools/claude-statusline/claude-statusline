@@ -1,0 +1,350 @@
+#!/usr/bin/env bash
+# Claude Code statusLine command
+# Segments: cwd · model · effort · ctx-usage · quota(7d / 5h) · git-branch · cost
+input=$(cat)
+
+# ── Soft 256-color palette ───────────────────────────────────────────────────
+RESET=$'\033[0m'
+# Medium gray slightly brighter than ANSI faint for secondary metadata
+DIM=$'\033[38;5;242m'
+# Slightly brighter gray for context used/total readability
+DIM_BRIGHT=$'\033[38;5;245m'
+BOLD_BLUE=$'\033[1;34m'
+# Muted non-bold 256-color tones for informative accents
+SOFT_GREEN=$'\033[38;5;108m'   # Sage green (effort)
+SOFT_AMBER=$'\033[38;5;137m'   # Deep amber (percentages)
+SOFT_CYAN=$'\033[38;5;73m'     # Muted cyan (model)
+SEP="${DIM} · ${RESET}"
+
+FALLBACK_CWD="$(pwd)"
+
+# ── Extract fields in one Python pass and eval into shell variables ──────────
+eval "$(FALLBACK_CWD="$FALLBACK_CWD" python3 -I -c '
+import json
+import math
+import os
+import re
+import sys
+import time
+
+
+def expand_home(path):
+    if not path:
+        return ""
+    home = os.environ.get("HOME", "")
+    if path == "~":
+        return home or os.path.expanduser("~")
+    if path.startswith("~/"):
+        return os.path.join(home, path[2:]) if home else os.path.expanduser(path)
+    return path
+
+
+def normalize_dir(path):
+    if not path:
+        return ""
+    stripped = path.rstrip("/")
+    return stripped if stripped else "/"
+
+
+def format_cwd_display(cwd, aliases_raw):
+    if not cwd:
+        return ""
+    norm_cwd = normalize_dir(cwd)
+    rules = []
+    for entry in (aliases_raw or "").split(":"):
+        if "=" not in entry:
+            continue
+        raw_prefix, alias = (part.strip() for part in entry.split("=", 1))
+        prefix = normalize_dir(expand_home(raw_prefix))
+        if prefix and alias:
+            rules.append((prefix, alias))
+
+    for prefix, alias in sorted(rules, key=lambda item: len(item[0]), reverse=True):
+        if norm_cwd == prefix:
+            return alias
+        if prefix == "/" and norm_cwd.startswith("/"):
+            rest = norm_cwd.lstrip("/")
+            base = "" if alias == "/" else alias.rstrip("/")
+            return f"{base}/{rest}" if rest else alias
+        if norm_cwd.startswith(prefix + "/"):
+            base = "" if alias == "/" else alias.rstrip("/")
+            return f"{base}/{norm_cwd[len(prefix) + 1:]}"
+
+    home = os.environ.get("HOME", "")
+    norm_home = home.rstrip("/") if home else ""
+    if norm_home:
+        if norm_cwd == norm_home:
+            return "~"
+        if norm_cwd.startswith(norm_home + "/"):
+            return "~" + norm_cwd[len(norm_home):]
+    return cwd
+
+
+def as_str(val):
+    return val if isinstance(val, str) else ""
+
+
+def as_float(val):
+    if isinstance(val, bool) or val is None:
+        return None
+    try:
+        f = float(val)
+        if math.isnan(f) or math.isinf(f):
+            return None
+        return f
+    except Exception:
+        return None
+
+
+def as_int(val):
+    if isinstance(val, bool) or val is None:
+        return 0
+    if isinstance(val, int):
+        return val
+    f = as_float(val)
+    if f is None:
+        return 0
+    try:
+        return int(f)
+    except Exception:
+        return 0
+
+
+def as_log_num(val):
+    f = as_float(val)
+    if f is None:
+        return None
+    if isinstance(val, int) and not isinstance(val, bool):
+        return val
+    return f
+
+
+def fmt_tokens(n):
+    if n is None or n == "":
+        return ""
+    if n >= 1_000_000:
+        return f"{n // 1_000_000}M"
+    if n >= 1000:
+        return f"{n // 1000}k"
+    return str(n)
+
+
+try:
+    d = json.loads(sys.stdin.read())
+    if not isinstance(d, dict):
+        d = {}
+except Exception:
+    d = {}
+
+# Resolve state directory (default quota log directory)
+raw_state_dir = os.environ.get("CLAUDE_STATUSLINE_STATE_DIR", "").strip()
+if raw_state_dir:
+    state_dir = expand_home(raw_state_dir)
+else:
+    raw_cfg_dir = os.environ.get("CLAUDE_CONFIG_DIR", "").strip()
+    if raw_cfg_dir:
+        state_dir = expand_home(raw_cfg_dir)
+    else:
+        home_dir = os.environ.get("HOME") or os.path.expanduser("~")
+        state_dir = os.path.join(home_dir, ".claude")
+
+# 1. cwd / workspace (prefer workspace.current_dir, fall back to cwd, then $PWD)
+ws = d.get("workspace")
+ws_dir = as_str(ws.get("current_dir")) if isinstance(ws, dict) else ""
+cwd = ws_dir or as_str(d.get("cwd")) or os.environ.get("FALLBACK_CWD") or ""
+cwd_disp = format_cwd_display(cwd, os.environ.get("CLAUDE_STATUSLINE_PATH_ALIASES", ""))
+
+# 2. model (prefer display_name, fall back to id; strip trailing effort tag only)
+m_obj = d.get("model")
+if not isinstance(m_obj, dict):
+    m_obj = {}
+raw_model = as_str(m_obj.get("display_name")) or as_str(m_obj.get("id"))
+clean_model = re.sub(
+    r"\s*\((Low|Medium|High|XHigh|Max)\)\s*$",
+    "",
+    raw_model,
+    flags=re.I,
+).strip()
+
+# 3. effort
+eff_obj = d.get("effort")
+effort = as_str(eff_obj.get("level")).strip() if isinstance(eff_obj, dict) else ""
+
+# 4. context window usage
+cw = d.get("context_window")
+if not isinstance(cw, dict):
+    cw = {}
+cu = cw.get("current_usage")
+if not isinstance(cu, dict):
+    cu = {}
+used = (
+    max(0, as_int(cu.get("input_tokens")))
+    + max(0, as_int(cu.get("cache_creation_input_tokens")))
+    + max(0, as_int(cu.get("cache_read_input_tokens")))
+)
+if used <= 0:
+    used = max(0, as_int(cw.get("total_input_tokens")))
+total = max(0, as_int(cw.get("context_window_size")))
+pct_val = as_float(cw.get("used_percentage"))
+pct_str = f"{round(pct_val)}" if pct_val is not None and pct_val >= 0 else ""
+
+# 5. rate limits (seven_day and five_hour extracted independently)
+rl = d.get("rate_limits")
+if not isinstance(rl, dict):
+    rl = {}
+sd = rl.get("seven_day")
+if not isinstance(sd, dict):
+    sd = {}
+fh = rl.get("five_hour")
+if not isinstance(fh, dict):
+    fh = {}
+
+now_ts = time.time()
+
+q7d_val = as_float(sd.get("used_percentage"))
+quota7d_str = f"{round(q7d_val)}" if q7d_val is not None and q7d_val >= 0 else ""
+r7d_ts = as_float(sd.get("resets_at"))
+reset7d = ""
+if r7d_ts is not None and r7d_ts > 0:
+    days = max(0.0, (r7d_ts - now_ts) / 86400.0)
+    reset7d = f"{days:.1f}d"
+
+q5h_val = as_float(fh.get("used_percentage"))
+quota5h_str = f"{round(q5h_val)}" if q5h_val is not None and q5h_val >= 0 else ""
+r5h_ts = as_float(fh.get("resets_at"))
+reset5h = ""
+if r5h_ts is not None and r5h_ts > 0:
+    try:
+        lt = time.localtime(r5h_ts)
+        now_lt = time.localtime(now_ts)
+        same_day = time.strftime("%Y%m%d", lt) == time.strftime("%Y%m%d", now_lt)
+        reset5h = time.strftime("%H:%M" if same_day else "%m-%d %H:%M", lt)
+    except Exception:
+        reset5h = ""
+
+# Opt-in quota change log (disabled by default)
+raw_quota_log = os.environ.get("CLAUDE_STATUSLINE_QUOTA_LOG", "").strip()
+low_quota_log = raw_quota_log.lower()
+if not raw_quota_log or low_quota_log in ("0", "false"):
+    log_file = ""
+elif low_quota_log in ("1", "true"):
+    log_file = os.path.join(state_dir, "quota-log.jsonl")
+else:
+    log_file = expand_home(raw_quota_log)
+
+log_7d = as_log_num(sd.get("used_percentage")) if q7d_val is not None and q7d_val >= 0 else None
+log_7d_reset = as_log_num(sd.get("resets_at")) if r7d_ts is not None and r7d_ts > 0 else None
+log_5h = as_log_num(fh.get("used_percentage")) if q5h_val is not None and q5h_val >= 0 else None
+log_5h_reset = as_log_num(fh.get("resets_at")) if r5h_ts is not None and r5h_ts > 0 else None
+
+if log_file and any(x is not None for x in (log_7d, log_7d_reset, log_5h, log_5h_reset)):
+    try:
+        rec = {
+            "7d": log_7d,
+            "7d_reset": log_7d_reset,
+            "5h": log_5h,
+            "5h_reset": log_5h_reset,
+        }
+        prev = {}
+        try:
+            with open(log_file, "rb") as f:
+                f.seek(0, 2)
+                f.seek(max(0, f.tell() - 1024))
+                lines = f.read().decode("utf-8", errors="ignore").strip().splitlines()
+                if lines:
+                    parsed = json.loads(lines[-1])
+                    if isinstance(parsed, dict):
+                        prev = parsed
+        except Exception:
+            pass
+        if any(prev.get(k) != v for k, v in rec.items()):
+            log_dir = os.path.dirname(log_file)
+            if log_dir:
+                os.makedirs(log_dir, exist_ok=True)
+            with open(log_file, "a", encoding="utf-8") as f:
+                f.write(json.dumps({"ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"), **rec}) + "\n")
+    except Exception:
+        pass
+
+# 6. cost
+cost_obj = d.get("cost")
+cost_val = as_float(cost_obj.get("total_cost_usd")) if isinstance(cost_obj, dict) else None
+cost_str = f"{cost_val:.2f}" if cost_val is not None and cost_val >= 0 else ""
+
+out = {
+    "cwd":      cwd,
+    "cwd_disp": cwd_disp,
+    "model":    clean_model,
+    "effort":   effort,
+    "used":     fmt_tokens(used) if used > 0 else "",
+    "total":    fmt_tokens(total) if total > 0 else "",
+    "pct":      pct_str,
+    "quota7d":  quota7d_str,
+    "reset7d":  reset7d,
+    "quota5h":  quota5h_str,
+    "reset5h":  reset5h,
+    "cost":     cost_str,
+}
+
+for k, v in out.items():
+    safe = str(v).replace("\x27", "\x27\\\x27\x27")
+    print(f"_{k}=\x27{safe}\x27")
+' <<< "$input")"
+
+# ── segment 1: cwd ───────────────────────────────────────────────────────────
+cwd="${_cwd:-$FALLBACK_CWD}"
+cwd_disp="${_cwd_disp:-$cwd}"
+seg1=$(printf "${BOLD_BLUE}%s${RESET}" "$cwd_disp")
+
+# ── segment 2: model ─────────────────────────────────────────────────────────
+seg2=""
+[ -n "$_model" ] && seg2=$(printf "${SOFT_CYAN}%s${RESET}" "$_model")
+
+# ── segment 3: effort ────────────────────────────────────────────────────────
+seg3=""
+[ -n "$_effort" ] && seg3=$(printf "${SOFT_GREEN}%s${RESET}" "$_effort")
+
+# ── segment 4: context usage ─────────────────────────────────────────────────
+seg4=""
+if [ -n "$_used" ] && [ -n "$_total" ]; then
+  if [ -n "$_pct" ]; then
+    seg4=$(printf "${DIM_BRIGHT}%s/%s${RESET} ${SOFT_AMBER}%s%%${RESET}" \
+      "$_used" "$_total" "$_pct")
+  else
+    seg4=$(printf "${DIM_BRIGHT}%s/%s${RESET}" "$_used" "$_total")
+  fi
+elif [ -n "$_pct" ]; then
+  seg4=$(printf "${SOFT_AMBER}%s%%${RESET}" "$_pct")
+fi
+
+# ── segment 5: quota usage (7d / 5h) ─────────────────────────────────────────
+seg5=""
+if [ -n "$_quota7d" ]; then
+  seg5=$(printf "${DIM}7d${RESET} ${SOFT_AMBER}%s%%${RESET}" "$_quota7d")
+  [ -n "$_reset7d" ] && seg5="${seg5}$(printf " ${DIM}↻ %s${RESET}" "$_reset7d")"
+fi
+if [ -n "$_quota5h" ]; then
+  seg5h=$(printf "${DIM}5h${RESET} ${SOFT_AMBER}%s%%${RESET}" "$_quota5h")
+  [ -n "$_reset5h" ] && seg5h="${seg5h}$(printf " ${DIM}↻ %s${RESET}" "$_reset5h")"
+  seg5="${seg5:+${seg5}${SEP}}${seg5h}"
+fi
+
+# ── segment 6: git branch ────────────────────────────────────────────────────
+seg6=""
+if [ -n "$cwd" ] && [ -d "$cwd" ] && git -C "$cwd" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  branch=$(git -C "$cwd" symbolic-ref --short HEAD 2>/dev/null \
+    || git -C "$cwd" rev-parse --short HEAD 2>/dev/null)
+  [ -n "$branch" ] && seg6=$(printf "${DIM}%s${RESET}" "$branch")
+fi
+
+# ── segment 7: cost ──────────────────────────────────────────────────────────
+seg7=""
+[ -n "$_cost" ] && seg7=$(printf "${DIM}\$%s${RESET}" "$_cost")
+
+# ── Assemble final status line ───────────────────────────────────────────────
+output="$seg1"
+for seg in "$seg2" "$seg3" "$seg4" "$seg5" "$seg6" "$seg7"; do
+  [ -n "$seg" ] && output="${output}${SEP}${seg}"
+done
+
+printf "%s" "$output"

@@ -16,6 +16,7 @@
 | --- | --- | --- | --- |
 | **Tools** | `agy-quota-wakeup` | Antigravity 周额度（`gemini-weekly` 与 `3p-weekly`）零消耗定时探测与最小 Chat-only 自动唤醒守护工具（支持 macOS `launchd` 与 Linux/WSL2 `systemd --user`）。 | [`tools/agy-quota-wakeup/README.zh-CN.md`](tools/agy-quota-wakeup/README.zh-CN.md) |
 | **Tools** | `agy-statusline` | Antigravity CLI（`agy`）的柔和 256 色 7 段 `statusLine` 状态栏脚本，支持 transcript `CHECKPOINT` 兜底统计与配额缓存原子持久化。 | [`tools/agy-statusline/README.zh-CN.md`](tools/agy-statusline/README.zh-CN.md) |
+| **Tools** | `claude-statusline` | Claude Code 的柔和 256 色 7 段 `statusLine` 状态栏脚本，兼容订阅配额与 API Key / 第三方后端优雅降级，并支持可选配额变更日志。 | [`tools/claude-statusline/README.zh-CN.md`](tools/claude-statusline/README.zh-CN.md) |
 | **Tools** | `codex-quota-wakeup` | Codex CLI（ChatGPT 订阅）周额度零消耗定时探测与隔离只读最小唤醒守护工具（支持 macOS `launchd` 与 Linux/WSL2 `systemd --user`）。 | [`tools/codex-quota-wakeup/README.zh-CN.md`](tools/codex-quota-wakeup/README.zh-CN.md) |
 | **Hooks** | `codex-depth-guard` | Codex CLI 多智能体（`multi_agent_v2`）的严格 fail-closed `PreToolUse` 深度守卫钩子，基于 transcript 权威深度拦截超限 `spawn_agent` 递归委派。 | [`hooks/codex-depth-guard/README.zh-CN.md`](hooks/codex-depth-guard/README.zh-CN.md) |
 | **Guides** | `google-ai-perks` | 给 AI Agent 直接读取执行的 Google AI Pro / Ultra 订阅福利全量核查、领取、配置与验收指南（Cloud 赠金、Colab GPU 算力、Flow、云盘、YouTube 等）。 | [`guides/google-ai-perks/README.zh-CN.md`](guides/google-ai-perks/README.zh-CN.md) |
@@ -77,7 +78,29 @@ chmod +x ~/.gemini/antigravity-cli/agy-statusline
 
 路径缩写别名（`AGY_STATUSLINE_PATH_ALIASES`）、可选配额变更日志（`AGY_STATUSLINE_QUOTA_LOG`）与本地状态文件说明见 [`tools/agy-statusline/README.zh-CN.md`](tools/agy-statusline/README.zh-CN.md)。
 
-### 3. 安装 Codex 多智能体深度守卫钩子（`hooks/codex-depth-guard`）
+### 3. 安装 Claude Code 状态栏（`tools/claude-statusline`）
+
+复制脚本（要求 Bash 3.2+ 与 Python 3.7+，`git` 可选）到 `${CLAUDE_CONFIG_DIR:-$HOME/.claude}`，并在 `~/.claude/settings.json`（或 `${CLAUDE_CONFIG_DIR}/settings.json`）中启用 `statusLine`：
+
+```bash
+CLAUDE_DIR="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
+mkdir -p "$CLAUDE_DIR"
+cp tools/claude-statusline/claude-statusline "$CLAUDE_DIR/claude-statusline"
+chmod +x "$CLAUDE_DIR/claude-statusline"
+```
+
+```json
+{
+  "statusLine": {
+    "type": "command",
+    "command": "bash \"${CLAUDE_CONFIG_DIR:-$HOME/.claude}/claude-statusline\""
+  }
+}
+```
+
+路径缩写别名（`CLAUDE_STATUSLINE_PATH_ALIASES`）、可选配额变更日志（`CLAUDE_STATUSLINE_QUOTA_LOG`）与状态目录说明（`CLAUDE_STATUSLINE_STATE_DIR`）见 [`tools/claude-statusline/README.zh-CN.md`](tools/claude-statusline/README.zh-CN.md)。
+
+### 4. 安装 Codex 多智能体深度守卫钩子（`hooks/codex-depth-guard`）
 
 复制钩子脚本（要求 Python 3.8+ 与支持 `PreToolUse` hooks 的 Codex CLI），并在 `${CODEX_HOME:-$HOME/.codex}/config.toml`（默认 `~/.codex/config.toml`）中挂载：
 
@@ -104,7 +127,7 @@ timeout = 10
 
 深度层级规则（`CODEX_MAX_CALLER_DEPTH` 默认 `1`，即 3 层封顶）与 fail-closed 拦截边界见 [`hooks/codex-depth-guard/README.zh-CN.md`](hooks/codex-depth-guard/README.zh-CN.md)。
 
-### 4. 使用 Agent 操作指南（`guides/google-ai-perks`）
+### 5. 使用 Agent 操作指南（`guides/google-ai-perks`）
 
 直接把 [`guides/google-ai-perks/google-ai-perks-agent-guide.zh-CN.md`](guides/google-ai-perks/google-ai-perks-agent-guide.zh-CN.md) 交给你的 AI Agent（Antigravity / Claude Code / Codex），让它按指南帮你自动核查、领取并验收 Google AI 订阅福利。详情见 [`guides/google-ai-perks/README.zh-CN.md`](guides/google-ai-perks/README.zh-CN.md)。
 
@@ -117,6 +140,7 @@ timeout = 10
 ```bash
 python3 tools/agy-quota-wakeup/test_agy_quota_wakeup.py -v
 python3 tools/agy-statusline/test_agy_statusline.py -v
+python3 tools/claude-statusline/test_claude_statusline.py -v
 python3 tools/codex-quota-wakeup/test_codex_quota_wakeup.py -v
 python3 hooks/codex-depth-guard/test_codex_depth_guard.py -v
 ```
