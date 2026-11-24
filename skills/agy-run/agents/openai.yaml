@@ -1,0 +1,7 @@
+interface:
+  display_name: "agy Run"
+  short_description: "Run, resume, or live-steer a bounded Gemini agent task through agy"
+  default_prompt: "Use $agy-run to run, resume, or steer this bounded task in agy with the appropriate model, effort, and sandbox mode, then review its final answer."
+
+policy:
+  allow_implicit_invocation: true

@@ -1,0 +1,7 @@
+interface:
+  display_name: "Codex Run"
+  short_description: "Run, resume, or live-steer a local Codex agent task"
+  default_prompt: "Use $codex-run to delegate a bounded local Codex agent task."
+
+policy:
+  allow_implicit_invocation: true

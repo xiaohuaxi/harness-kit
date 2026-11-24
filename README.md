@@ -4,7 +4,7 @@
 
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 
-Standalone CLI tools, hooks, agent-executable guides, and reusable building blocks for **Claude Code**, **Codex**, and **Antigravity (`agy`)**.
+Standalone CLI tools, skills, hooks, agent-executable guides, and reusable building blocks for **Claude Code**, **Codex**, and **Antigravity (`agy`)**.
 
 > Every module here is self-contained with zero third-party dependencies (Python standard library / stock Bash only), designed to drop directly into your existing coding agent setup without adopting a monolithic dotfiles repository.
 
@@ -19,6 +19,8 @@ Standalone CLI tools, hooks, agent-executable guides, and reusable building bloc
 | **Tools** | `claude-statusline` | Soft 256-color, 7-segment `statusLine` command for Claude Code with graceful API-key / third-party fallback and opt-in quota history logging. | [`tools/claude-statusline/README.md`](tools/claude-statusline/README.md) |
 | **Tools** | `codex-quota-wakeup` | Zero-token polling & isolated minimal read-only weekly quota wakeup daemon (`launchd` / `systemd --user`) for Codex CLI ChatGPT subscriptions. | [`tools/codex-quota-wakeup/README.md`](tools/codex-quota-wakeup/README.md) |
 | **Hooks** | `codex-depth-guard` | Fail-closed `PreToolUse` recursion depth guard hook for Codex CLI multi-agent (`multi_agent_v2`), capping `spawn_agent` nesting depth with authoritative transcript checks. | [`hooks/codex-depth-guard/README.md`](hooks/codex-depth-guard/README.md) |
+| **Skills** | `agy-run` | Cross-agent skill and pure-stdlib Python runner for bounded Antigravity (`agy acp`) tasks with `--resume`, live `--steer`, three-tier sandbox checks, and `--list-models`. | [`skills/agy-run/README.md`](skills/agy-run/README.md) |
+| **Skills** | `codex-run` | Cross-agent skill and pure-stdlib Python runner for bounded `codex app-server` tasks with `--resume`, live `--steer`, anti-early-exit subagent draining, external profiles, and `--list-models`. | [`skills/codex-run/README.md`](skills/codex-run/README.md) |
 | **Guides** | `google-ai-perks` | Agent-executable guide to inspect, claim, configure, and verify Google AI Pro / Ultra subscription perks (Cloud credits, Colab GPU CU, Flow, Drive, YouTube, etc.). | [`guides/google-ai-perks/README.md`](guides/google-ai-perks/README.md) |
 
 ---
@@ -127,7 +129,35 @@ timeout = 10
 
 Depth hierarchy (`CODEX_MAX_CALLER_DEPTH`, default `1` for 3 levels total) and fail-closed boundary details are documented in [`hooks/codex-depth-guard/README.md`](hooks/codex-depth-guard/README.md).
 
-### 5. Agent Guides (`guides/google-ai-perks`)
+### 5. Cross-Agent Runner Skills (`skills/agy-run`, `skills/codex-run`)
+
+Both skills require a POSIX host (macOS, Linux, or WSL2), Python 3.8+, and the corresponding local CLI (`agy` / `codex`). Copy or symlink each skill directory into your host agent's skill directory:
+
+| Host | Skill directory |
+| --- | --- |
+| Claude Code | `~/.claude/skills/<skill>` |
+| Codex | `~/.agents/skills/<skill>` |
+| Antigravity (`agy`) | `~/.gemini/config/skills/<skill>` |
+
+```bash
+# Example: install into Claude Code's skill directory (adjust target for Codex or agy)
+mkdir -p ~/.claude/skills
+cp -R skills/agy-run ~/.claude/skills/agy-run
+cp -R skills/codex-run ~/.claude/skills/codex-run
+
+# agy-run (required one-time setup: installs 6 managed agent definitions under ~/.gemini/config/agents)
+python3 ~/.claude/skills/agy-run/scripts/agy_run.py --install-agents
+python3 ~/.claude/skills/agy-run/scripts/agy_run.py --list-models
+
+# codex-run (list models from local models_cache.json, or pass --profile <name>)
+python3 ~/.claude/skills/codex-run/scripts/codex_run.py --list-models
+```
+
+Full flags (`--write`, `--yolo`, `--resume`, `--steer`, `--profile`), sandbox scope, and architecture notes are in each skill's README:
+- [`skills/agy-run/README.md`](skills/agy-run/README.md)
+- [`skills/codex-run/README.md`](skills/codex-run/README.md)
+
+### 6. Agent Guides (`guides/google-ai-perks`)
 
 Point your AI agent (Antigravity / Claude Code / Codex) to [`guides/google-ai-perks/google-ai-perks-agent-guide.md`](guides/google-ai-perks/google-ai-perks-agent-guide.md) and ask it to inspect, claim, configure, and verify your Google AI subscription perks. See [`guides/google-ai-perks/README.md`](guides/google-ai-perks/README.md) for details.
 
@@ -135,7 +165,7 @@ Point your AI agent (Antigravity / Claude Code / Codex) to [`guides/google-ai-pe
 
 ## Running Tests
 
-Each tool and hook includes standalone unit tests using Python's built-in `unittest`:
+Each tool, hook, and skill includes standalone unit tests using Python's built-in `unittest`:
 
 ```bash
 python3 tools/agy-quota-wakeup/test_agy_quota_wakeup.py -v
@@ -143,6 +173,8 @@ python3 tools/agy-statusline/test_agy_statusline.py -v
 python3 tools/claude-statusline/test_claude_statusline.py -v
 python3 tools/codex-quota-wakeup/test_codex_quota_wakeup.py -v
 python3 hooks/codex-depth-guard/test_codex_depth_guard.py -v
+python3 skills/agy-run/tests/test_agy_run.py -v
+python3 skills/codex-run/tests/test_codex_run.py -v
 ```
 
 ---
