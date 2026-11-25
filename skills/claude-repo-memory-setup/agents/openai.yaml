@@ -1,0 +1,7 @@
+interface:
+  display_name: "Claude Repo Memory Setup"
+  short_description: "Move Claude Code project memory into .agents/memory/ and symlink it back"
+  default_prompt: "Use $claude-repo-memory-setup to migrate this project's Claude Code auto-memory into <repo>/.agents/memory and create a symlink back at the global location."
+
+policy:
+  allow_implicit_invocation: false

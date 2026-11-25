@@ -21,6 +21,7 @@
 | **Hooks** | `agy-agent-depth-guard` | Antigravity CLI（`agy`）子代理委派的严格 fail-closed `PreToolUse` 深度守卫钩子，基于父链溯源拦截超限 `invoke_subagent` 递归委派。 | [`hooks/agy-agent-depth-guard/README.zh-CN.md`](hooks/agy-agent-depth-guard/README.zh-CN.md) |
 | **Hooks** | `codex-agent-depth-guard` | Codex CLI 多智能体（`multi_agent_v2`）的严格 fail-closed `PreToolUse` 深度守卫钩子，基于 transcript 权威深度拦截超限 `spawn_agent` 递归委派。 | [`hooks/codex-agent-depth-guard/README.zh-CN.md`](hooks/codex-agent-depth-guard/README.zh-CN.md) |
 | **Skills** | `agy-run` | 通过 `agy acp` 执行有界 Antigravity（Gemini）任务的跨端 Skill 与纯标准库 runner，支持 `--resume`、运行中 `--steer`、三档沙箱核验与 `--list-models`。 | [`skills/agy-run/README.zh-CN.md`](skills/agy-run/README.zh-CN.md) |
+| **Skills** | `claude-repo-memory-setup` | 零第三方依赖的跨端 Skill 与 Bash 工具，将 Claude Code 默认项目记忆安全迁入 `<repo>/.agents/memory/` 并原位建链回指，附严格 fail-closed Git/SVN 边界防护。 | [`skills/claude-repo-memory-setup/README.zh-CN.md`](skills/claude-repo-memory-setup/README.zh-CN.md) |
 | **Skills** | `codex-run` | 通过 `codex app-server` 执行有界 Codex 任务的跨端 Skill 与纯标准库 runner，支持 `--resume`、运行中 `--steer`、防早退子 Agent 排空、外置 profile 与 `--list-models`。 | [`skills/codex-run/README.zh-CN.md`](skills/codex-run/README.zh-CN.md) |
 | **Guides** | `google-ai-perks` | 给 AI Agent 直接读取执行的 Google AI Pro / Ultra 订阅福利全量核查、领取、配置与验收指南（Cloud 赠金、Colab GPU 算力、Flow、云盘、YouTube 等）。 | [`guides/google-ai-perks/README.zh-CN.md`](guides/google-ai-perks/README.zh-CN.md) |
 
@@ -188,7 +189,23 @@ python3 ~/.claude/skills/codex-run/scripts/codex_run.py --list-models
 - [`skills/agy-run/README.zh-CN.md`](skills/agy-run/README.zh-CN.md)
 - [`skills/codex-run/README.zh-CN.md`](skills/codex-run/README.zh-CN.md)
 
-### 7. 使用 Agent 操作指南（`guides/google-ai-perks`）
+### 7. 安装 Claude Code 仓库记忆迁移工具（`skills/claude-repo-memory-setup`）
+
+要求 POSIX 平台（macOS、Linux 或 WSL2）与 Bash 3.2+（`git`/`svn` 按需使用）。将目录复制或软链到目标宿主的 skill 目录（路径同上），并按需把脚本软链进 `PATH`：
+
+```bash
+mkdir -p ~/.claude/skills ~/.local/bin
+cp -R skills/claude-repo-memory-setup ~/.claude/skills/claude-repo-memory-setup
+ln -s "$HOME/.claude/skills/claude-repo-memory-setup/claude-repo-memory-setup.sh" ~/.local/bin/claude-repo-memory-setup
+
+# 只读预检，再将项目默认的 Claude 自动记忆安全迁入 <repo>/.agents/memory/ 并原位建链
+claude-repo-memory-setup --check-only /path/to/repo
+claude-repo-memory-setup /path/to/repo
+```
+
+与原生 `autoMemoryDirectory` 的对比、fail-closed Git/SVN 边界防护、Skill 显式调用（`/claude-repo-memory-setup` / `$claude-repo-memory-setup`）以及给 Codex / `agy` 的按需查阅片段见 [`skills/claude-repo-memory-setup/README.zh-CN.md`](skills/claude-repo-memory-setup/README.zh-CN.md)。
+
+### 8. 使用 Agent 操作指南（`guides/google-ai-perks`）
 
 直接把 [`guides/google-ai-perks/google-ai-perks-agent-guide.zh-CN.md`](guides/google-ai-perks/google-ai-perks-agent-guide.zh-CN.md) 交给你的 AI Agent（Antigravity / Claude Code / Codex），让它按指南帮你自动核查、领取并验收 Google AI 订阅福利。详情见 [`guides/google-ai-perks/README.zh-CN.md`](guides/google-ai-perks/README.zh-CN.md)。
 
@@ -206,6 +223,7 @@ python3 tools/codex-quota-wakeup/test_codex_quota_wakeup.py -v
 python3 hooks/agy-agent-depth-guard/test_agy_agent_depth_guard.py -v
 python3 hooks/codex-agent-depth-guard/test_codex_agent_depth_guard.py -v
 python3 skills/agy-run/tests/test_agy_run.py -v
+python3 skills/claude-repo-memory-setup/tests/test_claude_repo_memory_setup.py -v
 python3 skills/codex-run/tests/test_codex_run.py -v
 ```
 

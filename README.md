@@ -21,6 +21,7 @@ Standalone CLI tools, skills, hooks, agent-executable guides, and reusable build
 | **Hooks** | `agy-agent-depth-guard` | Fail-closed `PreToolUse` recursion depth guard hook for Antigravity CLI (`agy`) subagent delegation, capping `invoke_subagent` nesting depth via ancestry tracing. | [`hooks/agy-agent-depth-guard/README.md`](hooks/agy-agent-depth-guard/README.md) |
 | **Hooks** | `codex-agent-depth-guard` | Fail-closed `PreToolUse` recursion depth guard hook for Codex CLI multi-agent (`multi_agent_v2`), capping `spawn_agent` nesting depth with authoritative transcript checks. | [`hooks/codex-agent-depth-guard/README.md`](hooks/codex-agent-depth-guard/README.md) |
 | **Skills** | `agy-run` | Cross-agent skill and pure-stdlib Python runner for bounded Antigravity (`agy acp`) tasks with `--resume`, live `--steer`, three-tier sandbox checks, and `--list-models`. | [`skills/agy-run/README.md`](skills/agy-run/README.md) |
+| **Skills** | `claude-repo-memory-setup` | Zero-dependency skill and Bash utility to safely move Claude Code's project auto-memory into `<repo>/.agents/memory/` and symlink it back with fail-closed Git/SVN boundary guards. | [`skills/claude-repo-memory-setup/README.md`](skills/claude-repo-memory-setup/README.md) |
 | **Skills** | `codex-run` | Cross-agent skill and pure-stdlib Python runner for bounded `codex app-server` tasks with `--resume`, live `--steer`, anti-early-exit subagent draining, external profiles, and `--list-models`. | [`skills/codex-run/README.md`](skills/codex-run/README.md) |
 | **Guides** | `google-ai-perks` | Agent-executable guide to inspect, claim, configure, and verify Google AI Pro / Ultra subscription perks (Cloud credits, Colab GPU CU, Flow, Drive, YouTube, etc.). | [`guides/google-ai-perks/README.md`](guides/google-ai-perks/README.md) |
 
@@ -188,7 +189,23 @@ Full flags (`--write`, `--yolo`, `--resume`, `--steer`, `--profile`), sandbox sc
 - [`skills/agy-run/README.md`](skills/agy-run/README.md)
 - [`skills/codex-run/README.md`](skills/codex-run/README.md)
 
-### 7. Agent Guides (`guides/google-ai-perks`)
+### 7. Claude Code Repository Memory Setup (`skills/claude-repo-memory-setup`)
+
+Requires a POSIX host (macOS, Linux, or WSL2) and Bash 3.2+ (`git`/`svn` optional). Copy or symlink the skill into your host agent's skill directory (same paths as above) and optionally link the script onto `PATH`:
+
+```bash
+mkdir -p ~/.claude/skills ~/.local/bin
+cp -R skills/claude-repo-memory-setup ~/.claude/skills/claude-repo-memory-setup
+ln -s "$HOME/.claude/skills/claude-repo-memory-setup/claude-repo-memory-setup.sh" ~/.local/bin/claude-repo-memory-setup
+
+# Read-only preflight check, then migrate & symlink a repository's Claude auto-memory
+claude-repo-memory-setup --check-only /path/to/repo
+claude-repo-memory-setup /path/to/repo
+```
+
+Comparison with native `autoMemoryDirectory`, fail-closed Git/SVN guardrails, explicit skill invocation (`/claude-repo-memory-setup` / `$claude-repo-memory-setup`), and optional `AGENTS.md` snippet for Codex / `agy` are in [`skills/claude-repo-memory-setup/README.md`](skills/claude-repo-memory-setup/README.md).
+
+### 8. Agent Guides (`guides/google-ai-perks`)
 
 Point your AI agent (Antigravity / Claude Code / Codex) to [`guides/google-ai-perks/google-ai-perks-agent-guide.md`](guides/google-ai-perks/google-ai-perks-agent-guide.md) and ask it to inspect, claim, configure, and verify your Google AI subscription perks. See [`guides/google-ai-perks/README.md`](guides/google-ai-perks/README.md) for details.
 
@@ -206,6 +223,7 @@ python3 tools/codex-quota-wakeup/test_codex_quota_wakeup.py -v
 python3 hooks/agy-agent-depth-guard/test_agy_agent_depth_guard.py -v
 python3 hooks/codex-agent-depth-guard/test_codex_agent_depth_guard.py -v
 python3 skills/agy-run/tests/test_agy_run.py -v
+python3 skills/claude-repo-memory-setup/tests/test_claude_repo_memory_setup.py -v
 python3 skills/codex-run/tests/test_codex_run.py -v
 ```
 
