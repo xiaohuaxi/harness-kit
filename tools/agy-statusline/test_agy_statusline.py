@@ -410,6 +410,275 @@ class AgyStatuslineTests(unittest.TestCase):
             self.assertEqual(p2.returncode, 0, p2.stderr)
             self.assertEqual(strip_ansi(p2.stdout), "~ · 4 Carbon · low")
 
+    def test_auto_compact_override_formats_and_bounds(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td).resolve()
+            home_dir = root / "home"
+            state_dir = root / "state"
+            home_dir.mkdir()
+
+            base_payload = {
+                "cwd": str(home_dir),
+                "context_window": {
+                    "current_usage": {
+                        "input_tokens": 24_611,
+                        "cache_creation_input_tokens": 0,
+                        "cache_read_input_tokens": 200_000,
+                    },
+                    "context_window_size": 1_048_576,
+                    "used_percentage": 21.42,
+                },
+            }
+
+            cases = [
+                # Exact integer token count
+                ("350000", "~ · 224k/350k 64%"),
+                # K / M shorthands (case-insensitive, surrounding whitespace)
+                (" 350k ", "~ · 224k/350k 64%"),
+                ("800K", "~ · 224k/800k 28%"),
+                ("0.5M", "~ · 224k/500k 45%"),
+                ("0.5m", "~ · 224k/500k 45%"),
+                # Percentage (floor(1048576 * 50 / 100) = 524288 -> 524k, 224611/524288 = 42.84% -> 43%)
+                ("50%", "~ · 224k/524k 43%"),
+                # Equal to model window keeps payload percentage without alteration
+                ("1048576", "~ · 224k/1M 21%"),
+                ("100%", "~ · 224k/1M 21%"),
+            ]
+            for override_val, expected in cases:
+                proc = run_statusline(
+                    base_payload,
+                    home_dir=home_dir,
+                    state_dir=state_dir,
+                    extra_env={"AGY_CLI_AUTO_COMPACT_OVERRIDE": override_val},
+                )
+                self.assertEqual(proc.returncode, 0, f"override={override_val!r}: {proc.stderr}")
+                self.assertEqual(strip_ansi(proc.stdout), expected, f"override={override_val!r}")
+
+            # Exceeding model's context_window_size (e.g. 128K GPT-OSS with 350000) falls back to model window.
+            small_window_payload = {
+                "cwd": str(home_dir),
+                "context_window": {
+                    "current_usage": {"input_tokens": 65_536},
+                    "context_window_size": 131_072,
+                    "used_percentage": 50.0,
+                },
+            }
+            p_small = run_statusline(
+                small_window_payload,
+                home_dir=home_dir,
+                state_dir=state_dir,
+                extra_env={"AGY_CLI_AUTO_COMPACT_OVERRIDE": "350000"},
+            )
+            self.assertEqual(p_small.returncode, 0, p_small.stderr)
+            self.assertEqual(strip_ansi(p_small.stdout), "~ · 65k/131k 50%")
+
+            # Used exceeding override right before compaction still renders cleanly (e.g. 100%).
+            near_compact_payload = {
+                "cwd": str(home_dir),
+                "context_window": {
+                    "current_usage": {"input_tokens": 351_268},
+                    "context_window_size": 1_048_576,
+                    "used_percentage": 33.5,
+                },
+            }
+            p_near = run_statusline(
+                near_compact_payload,
+                home_dir=home_dir,
+                state_dir=state_dir,
+                extra_env={"AGY_CLI_AUTO_COMPACT_OVERRIDE": "350000"},
+            )
+            self.assertEqual(p_near.returncode, 0, p_near.stderr)
+            self.assertEqual(strip_ansi(p_near.stdout), "~ · 351k/350k 100%")
+
+            # Invalid / out-of-range values gracefully fall back to payload context_window_size & used_percentage.
+            for bad_override in (
+                "",
+                "   ",
+                "0",
+                "-350000",
+                "+350000",
+                "0%",
+                "101%",
+                "350.5",
+                "1e5",
+                "abc",
+                "9999999999",
+                "50\n%",
+                "５０%",
+                "５００k",
+                "9" * 5000,
+                ("9" * 5000) + "k",
+            ):
+                proc = run_statusline(
+                    base_payload,
+                    home_dir=home_dir,
+                    state_dir=state_dir,
+                    extra_env={"AGY_CLI_AUTO_COMPACT_OVERRIDE": bad_override},
+                )
+                self.assertEqual(proc.returncode, 0, f"bad_override={bad_override!r}: {proc.stderr}")
+                self.assertEqual(strip_ansi(proc.stdout), "~ · 224k/1M 21%", f"bad_override={bad_override!r}")
+
+            # Unknown context_window_size (0) must NOT fabricate a denominator from override.
+            unknown_window_payload = {
+                "cwd": str(home_dir),
+                "context_window": {
+                    "current_usage": {"input_tokens": 10_000},
+                    "context_window_size": 0,
+                },
+            }
+            p_unknown = run_statusline(
+                unknown_window_payload,
+                home_dir=home_dir,
+                state_dir=state_dir,
+                extra_env={"AGY_CLI_AUTO_COMPACT_OVERRIDE": "350000"},
+            )
+            self.assertEqual(p_unknown.returncode, 0, p_unknown.stderr)
+            self.assertEqual(strip_ansi(p_unknown.stdout), "~")
+
+    def test_parse_iso_dt_full_branch_coverage(self) -> None:
+        # Extract the inline Python `parse_iso_dt` implementation from agy-statusline so we can
+        # test every RFC 3339 / sentinel / overflow branch directly across Python 3.9+ and 3.15+.
+        script_src = SCRIPT_PATH.read_text(encoding="utf-8")
+        m = re.search(r"python3 -c '\n(.*?)\n' <<< \"\$input\"\)", script_src, re.DOTALL)
+        self.assertIsNotNone(m)
+        assert m is not None
+        py_src = m.group(1)
+        cutoff = py_src.index("\ndef as_str(")
+        ns: dict = {}
+        exec(py_src[:cutoff], ns)
+        parse_iso_dt = ns["parse_iso_dt"]
+
+        # Valid RFC 3339 variants: nanos, 1/2/3/6-digit fractional seconds, compact/colon tz, t/space/naive
+        valid_cases = [
+            ("2026-11-25T02:02:41Z", dt.datetime(2026, 11, 25, 2, 2, 41, tzinfo=dt.timezone.utc)),
+            ("2026-11-25t02:02:41z", dt.datetime(2026, 11, 25, 2, 2, 41, tzinfo=dt.timezone.utc)),
+            ("2026-11-25 02:02:41", dt.datetime(2026, 11, 25, 2, 2, 41, tzinfo=dt.timezone.utc)),
+            ("2026-11-25T02:02:41.5Z", dt.datetime(2026, 11, 25, 2, 2, 41, 500000, tzinfo=dt.timezone.utc)),
+            ("2026-11-25T02:02:41.12Z", dt.datetime(2026, 11, 25, 2, 2, 41, 120000, tzinfo=dt.timezone.utc)),
+            ("2026-11-25T02:02:41.123456789Z", dt.datetime(2026, 11, 25, 2, 2, 41, 123456, tzinfo=dt.timezone.utc)),
+            ("2026-11-25T10:02:41+0800", dt.datetime(2026, 11, 25, 2, 2, 41, tzinfo=dt.timezone.utc)),
+            ("2026-11-24T18:32:41-0730", dt.datetime(2026, 11, 25, 2, 2, 41, tzinfo=dt.timezone.utc)),
+            ("2026-11-25T10:02:41+08:00", dt.datetime(2026, 11, 25, 2, 2, 41, tzinfo=dt.timezone.utc)),
+            ("1970-01-02T00:00:01Z", dt.datetime(1970, 1, 2, 0, 0, 1, tzinfo=dt.timezone.utc)),
+        ]
+        for raw, expected_utc in valid_cases:
+            res = parse_iso_dt(raw)
+            self.assertIsNotNone(res, f"raw={raw!r}")
+            assert res is not None
+            self.assertEqual(res.astimezone(dt.timezone.utc), expected_utc, f"raw={raw!r}")
+
+        # Zero sentinels, underflow/overflow boundaries, and malformed inputs all return None
+        none_cases = [
+            None,
+            123,
+            "",
+            "   ",
+            "1970-01-01T00:00:00Z",
+            "1970-01-01T08:00:00+08:00",
+            "1969-12-31T19:00:00-05:00",
+            "1970-01-02T00:00:00Z",
+            "0001-01-01T00:00:00Z",
+            "0001-01-01T00:00:00+08:00",
+            "0002-01-01T00:00:00+08:00",
+            "9999-12-31T23:59:59-08:00",
+            "2026-02-30T00:00:00Z",
+            "2026-11-25T24:00:00Z",
+            "2026-11-25T02:02:41+25:00",
+            "2026-11-25T02:02:41+08:60",
+            "2026-11-25  02:02:41Z",
+            "2026-11-25T02:02:41Z garbage",
+            "２０２６-11-25T02:02:41Z",
+        ]
+        for raw in none_cases:
+            self.assertIsNone(parse_iso_dt(raw), f"expected None for {raw!r}")
+
+    def test_zero_reset_sentinel_and_unified_fallback_live_cache_and_log(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td).resolve()
+            home_dir = root / "home"
+            state_dir = root / "state"
+            home_dir.mkdir()
+
+            # 1) Sentinel timestamps across 7d and 5h buckets (with reset_in_seconds=0 or positive) hide ↻
+            #    and write empty g_reset / c_reset to quota-log.jsonl.
+            for sentinel_rt in (
+                "1970-01-01T00:00:00Z",
+                "1970-01-01T08:00:00+08:00",
+                "0001-01-01T00:00:00Z",
+                "0001-01-01T00:00:00+08:00",
+            ):
+                cur_state = state_dir / re.sub(r"[^A-Za-z0-9]+", "_", sentinel_rt)
+                payload = {
+                    "cwd": str(home_dir),
+                    "quota": {
+                        "gemini-weekly": {"remaining_fraction": 1.0, "reset_time": sentinel_rt, "reset_in_seconds": 0},
+                        "gemini-5h": {"remaining_fraction": 0.9, "reset_time": sentinel_rt, "reset_in_seconds": 3600},
+                        "3p-weekly": {"remaining_fraction": 1.0, "reset_time": sentinel_rt, "reset_in_seconds": 0},
+                        "3p-5h": {"remaining_fraction": 0.8, "reset_time": sentinel_rt, "reset_in_seconds": 0},
+                    },
+                }
+                p_live = run_statusline(
+                    payload,
+                    home_dir=home_dir,
+                    state_dir=cur_state,
+                    extra_env={"AGY_STATUSLINE_QUOTA_LOG": "1"},
+                )
+                self.assertEqual(p_live.returncode, 0, p_live.stderr)
+                plain_live = strip_ansi(p_live.stdout)
+                self.assertEqual(plain_live, "~ · G: 7d 0% 5h 10% · C: 7d 0%", f"sentinel={sentinel_rt!r}")
+                self.assertNotIn("↻", plain_live)
+
+                # Cache reload on subsequent quota-less tick matches live rendering exactly.
+                p_cached = run_statusline({"cwd": str(home_dir)}, home_dir=home_dir, state_dir=cur_state)
+                self.assertEqual(p_cached.returncode, 0, p_cached.stderr)
+                self.assertEqual(strip_ansi(p_cached.stdout), plain_live, f"cached sentinel={sentinel_rt!r}")
+
+                # Verify quota-log.jsonl recorded the 5h buckets with empty reset strings.
+                log_file = cur_state / "quota-log.jsonl"
+                self.assertTrue(log_file.is_file(), f"log missing for {sentinel_rt!r}")
+                lines = log_file.read_text(encoding="utf-8").strip().splitlines()
+                self.assertEqual(len(lines), 1)
+                rec = json.loads(lines[0])
+                self.assertEqual(rec["g_7d"], 0)
+                self.assertEqual(rec["g_5h"], 10)
+                self.assertEqual(rec["g_reset"], "")
+                self.assertEqual(rec["c_7d"], 0)
+                self.assertEqual(rec["c_5h"], 20)
+                self.assertEqual(rec["c_reset"], "")
+
+            # 2) Non-empty invalid reset_time + positive reset_in_seconds: live & cache BOTH hide reset (no fallback)
+            st_invalid_rt = state_dir / "invalid_rt"
+            payload_invalid_rt = {
+                "cwd": str(home_dir),
+                "quota": {
+                    "gemini-weekly": {"used_percentage": 15, "reset_time": "not-a-timestamp", "reset_in_seconds": 86400 * 3},
+                    "3p-weekly": {"used_percentage": 25, "reset_time": "2026-02-30T00:00:00Z", "reset_in_seconds": 86400 * 2},
+                },
+            }
+            p_inv_live = run_statusline(payload_invalid_rt, home_dir=home_dir, state_dir=st_invalid_rt)
+            self.assertEqual(p_inv_live.returncode, 0, p_inv_live.stderr)
+            self.assertEqual(strip_ansi(p_inv_live.stdout), "~ · G: 7d 15% · C: 7d 25%")
+
+            p_inv_cached = run_statusline({"cwd": str(home_dir)}, home_dir=home_dir, state_dir=st_invalid_rt)
+            self.assertEqual(p_inv_cached.returncode, 0, p_inv_cached.stderr)
+            self.assertEqual(strip_ansi(p_inv_cached.stdout), "~ · G: 7d 15% · C: 7d 25%")
+
+            # 3) Missing reset_time with non-positive / boolean reset_in_seconds hides reset cleanly
+            for idx, bad_secs in enumerate((0, -10, True, False, "NaN", "inf")):
+                st_bad = state_dir / f"bad_secs_{idx}"
+                payload_bad = {
+                    "cwd": str(home_dir),
+                    "quota": {
+                        "gemini-weekly": {"used_percentage": 5, "reset_in_seconds": bad_secs},
+                        "gemini-5h": {"used_percentage": 3, "reset_in_seconds": bad_secs},
+                    },
+                }
+                p_bad = run_statusline(payload_bad, home_dir=home_dir, state_dir=st_bad)
+                self.assertEqual(p_bad.returncode, 0, p_bad.stderr)
+                self.assertEqual(strip_ansi(p_bad.stdout), "~ · G: 7d 5% 5h 3%", f"bad_secs={bad_secs!r}")
+                p_bad_cached = run_statusline({"cwd": str(home_dir)}, home_dir=home_dir, state_dir=st_bad)
+                self.assertEqual(strip_ansi(p_bad_cached.stdout), "~ · G: 7d 5% 5h 3%", f"cached bad_secs={bad_secs!r}")
+
 
 if __name__ == "__main__":
     unittest.main()

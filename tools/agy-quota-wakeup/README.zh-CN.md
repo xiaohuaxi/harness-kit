@@ -11,8 +11,8 @@ AGY 的周额度窗口（`gemini-weekly` 与 `3p-weekly` 两套独立池）在�
 ## 工作方式
 
 1. **平时零消耗探测**：默认每半小时在 `:03`、`:33` 执行 `agy --output-format json -p=/usage`（0 Token、不创建会话），检查两个周额度桶；系统重启后不立即抢跑，而是自然顺延到下一个计划刻度，并由后台默认 `--min-uptime 300` 在开机前 5 分钟内自动宽限等待：
-   - **已激活**：`remaining_fraction < 1`，或 `reset_time` 距当前已不足 `7天 - 5分钟`；直接记日志退出，零消耗。
-   - **未激活**：`remaining_fraction == 1` 且 `reset_time` 仍随当前时刻贴着 `now + 7天` 漂移。
+   - **已激活 / 安全跳过**：`remaining_fraction < 1`，或 `reset_time` 正处于正常倒计时（`now < reset_time < now + 7天 - 5分钟`），或处于刚到期翻转临界态（`1970-01-02 UTC < reset_time <= now`，`reset_time_expired_pending`）；直接记日志退出，零消耗。
+   - **未激活**：`remaining_fraction == 1` 且 `reset_time` 为零值哨兵（`<= 1970-01-02 UTC`，如 `1970-01-01T00:00:00Z` / `0001-01-01T00:00:00Z`），或仍按旧版模式随当前时刻在 `now + 7天` 窗口内持续向前漂移；发送前会隔约 2.2 秒再做一次零消耗 `/usage` 同模式一致性复检。
 2. **最小 Chat-only 唤醒（带标准非 yolo 回退）**：仅当某池未激活时，优先在空临时目录内动态写入自包含的零工具配置（`.agents/agents/quota-wakeup.md`：`tools: []`、`inheritCustomizations: false`、`excludeDefaultComponents: true`），向目标池低思考深度模型发送一条单字 `OK` 请求（Gemini 池约 370 tokens，第三方池约 820 tokens、仅占周池约 `0.004%`）；若未来某版 `agy` 在发送前拒绝自定义配置或可选参数，自动回退到最精简的标准非 yolo 命令（`agy --model <id> --output-format json -p=...`，日志记录 `mode: "standard_fallback"`），随后复查 `/usage` 确认 7 天倒计时已锁定。
 3. **跨代与跨平台免维护**：
    - 模型 ID 从 `agy models` 动态挑选最新一代 `Flash Low` / `Claude Sonnet Low`，后续模型换代无需改版本号；

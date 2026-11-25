@@ -45,9 +45,19 @@ VERSION_CHECK_TIMEOUT_SECONDS = 45
 MAX_LOG_BYTES = 2 * 1024 * 1024  # 2 MiB per log file, keep 1 rotated backup
 WEEK_SECONDS = 7 * 86400
 COUNTDOWN_GRACE_SECONDS = 300  # reset_time < now + 7d - 5m => clock is already running
+POST_WAKE_MAX_SKEW_SECONDS = 600  # max allowed slack above now+7d for a valid 7-day window
 UNVERIFIED_COOLDOWN_SECONDS = 7200  # avoid hourly retry loop if a wakeup failed to lock timer
 JUST_ACTIVATED_WINDOW_SECONDS = 600
 CLOCK_BACKWARD_TOLERANCE_SECONDS = 300  # tolerate minor NTP / WSL2 resume clock rollbacks
+ZERO_RESET_SENTINEL_UTC = dt.datetime(1970, 1, 2, tzinfo=dt.timezone.utc)
+VERIFIED_ACTIVE_REASONS = frozenset(
+    {
+        "exhausted_0pct",
+        "remaining_below_100pct",
+        "usage_reported_in_description",
+        "reset_timer_counting_down",
+    }
+)
 
 STRIP_ENV_EXACT = {
     "GEMINI_API_KEY",
@@ -118,8 +128,10 @@ EFFORT_RANK = {
     "xhigh": 4,
     "max": 5,
 }
-TZ_COMPACT_RE = re.compile(r"([+-]\d{2})(\d{2})$")
-FRAC_SECONDS_RE = re.compile(r"\.(\d+)(?=[+-]\d{2}:\d{2}$|$)")
+ISO_RFC3339_RE = re.compile(
+    r"([0-9]{4}-[0-9]{2}-[0-9]{2})[Tt ]((?:[01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9])"
+    r"(?:\.([0-9]+))?(?:([Zz])|([+-])([01][0-9]|2[0-3]):?([0-5][0-9]))?"
+)
 
 CHAT_ONLY_AGENT_NAME = "quota-wakeup"
 CHAT_ONLY_AGENT_MD = (
@@ -146,23 +158,37 @@ def fmt_iso(ts: dt.datetime) -> str:
 
 
 def parse_iso_utc(raw: Optional[str]) -> Optional[dt.datetime]:
-    """Parse RFC3339 / ISO-8601 timestamps across Python 3.8+ (including Go nano precision)."""
-    if not raw or not isinstance(raw, str):
+    """Parse RFC 3339 / ISO-8601 timestamps to UTC across Python 3.8+ (incl. Go nanos)."""
+    if not isinstance(raw, str):
         return None
-    s = raw.strip()
-    if s.endswith(("Z", "z")):
-        s = s[:-1] + "+00:00"
-    else:
-        s = TZ_COMPACT_RE.sub(r"\1:\2", s)
-    # Python <3.11 (e.g. Ubuntu 22.04's Python 3.10) only accepts 0, 3, or 6 fractional digits.
-    s = FRAC_SECONDS_RE.sub(lambda m: "." + m.group(1)[:6].ljust(6, "0"), s)
+    m = ISO_RFC3339_RE.fullmatch(raw.strip())
+    if not m:
+        return None
+    date_part, time_part, frac_part, z_part, sign_part, tz_h, tz_m = m.groups()
+    iso = f"{date_part}T{time_part}"
+    if frac_part is not None:
+        iso += "." + frac_part[:6].ljust(6, "0")
+    iso += "+00:00" if (z_part is not None or sign_part is None) else f"{sign_part}{tz_h}:{tz_m}"
     try:
-        parsed = dt.datetime.fromisoformat(s)
+        parsed = dt.datetime.fromisoformat(iso)
     except ValueError:
         return None
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=dt.timezone.utc)
-    return parsed.astimezone(dt.timezone.utc)
+    if parsed.year <= 2:
+        return dt.datetime(1, 1, 1, tzinfo=dt.timezone.utc)
+    try:
+        return parsed.astimezone(dt.timezone.utc)
+    except OverflowError:
+        return None
+
+
+def is_zero_reset_sentinel(ts_utc: Optional[dt.datetime]) -> bool:
+    return ts_utc is not None and ts_utc <= ZERO_RESET_SENTINEL_UTC
+
+
+def in_valid_post_wake_window(ts_utc: Optional[dt.datetime], ref_utc: dt.datetime) -> bool:
+    if ts_utc is None or is_zero_reset_sentinel(ts_utc):
+        return False
+    return ref_utc < ts_utc <= (ref_utc + dt.timedelta(seconds=WEEK_SECONDS + POST_WAKE_MAX_SKEW_SECONDS))
 
 
 def custom_state_dir_override() -> Optional[Path]:
@@ -410,12 +436,22 @@ def evaluate_bucket_activity(
     """
     reset_raw = bucket.get("reset_time")
     reset_utc = parse_iso_utc(reset_raw)
+    is_zero = is_zero_reset_sentinel(reset_utc)
     seconds_until_reset: Optional[float] = None
-    if reset_utc is not None:
+    if reset_utc is not None and not is_zero:
         seconds_until_reset = (reset_utc - now_utc).total_seconds()
 
     desc = str(bucket.get("description") or "").strip()
-    local_reset_str = fmt_iso(reset_utc.astimezone()) if reset_utc else (str(reset_raw or ""))
+    local_reset_str: Optional[str]
+    if is_zero:
+        local_reset_str = None
+    elif reset_utc is not None:
+        try:
+            local_reset_str = fmt_iso(reset_utc.astimezone())
+        except OverflowError:
+            local_reset_str = fmt_iso(reset_utc)
+    else:
+        local_reset_str = str(reset_raw or "")
 
     rem_raw = bucket.get("remaining_fraction")
     if rem_raw is None:
@@ -426,7 +462,11 @@ def evaluate_bucket_activity(
         else:
             raise ValueError(f"Bucket {bucket.get('id')!r} missing `remaining_fraction`")
     else:
+        if isinstance(rem_raw, bool):
+            raise ValueError(f"Bucket {bucket.get('id')!r} has invalid boolean `remaining_fraction`: {rem_raw!r}")
         remaining = float(rem_raw)
+        if not math.isfinite(remaining) or remaining < 0.0 or remaining > 1.0:
+            raise ValueError(f"Bucket {bucket.get('id')!r} has out-of-range `remaining_fraction`: {rem_raw!r}")
 
     meta: Dict[str, Any] = {
         "remaining_fraction": remaining,
@@ -447,7 +487,10 @@ def evaluate_bucket_activity(
     if reset_utc is None:
         return True, "missing_reset_time", meta
 
-    if seconds_until_reset is not None and seconds_until_reset < (WEEK_SECONDS - COUNTDOWN_GRACE_SECONDS):
+    if not is_zero and seconds_until_reset is not None and seconds_until_reset <= 0.0:
+        return True, "reset_time_expired_pending", meta
+
+    if not is_zero and seconds_until_reset is not None and seconds_until_reset < (WEEK_SECONDS - COUNTDOWN_GRACE_SECONDS):
         return True, "reset_timer_counting_down", meta
 
     if isinstance(last_pool_state, dict):
@@ -455,23 +498,35 @@ def evaluate_bucket_activity(
         last_epoch = last_pool_state.get("last_probe_epoch")
         locked_reset_utc = parse_iso_utc(last_pool_state.get("locked_reset_time"))
         verified = last_pool_state.get("verified_active")
+        valid_last_epoch = (
+            isinstance(last_epoch, (int, float))
+            and not isinstance(last_epoch, bool)
+            and math.isfinite(float(last_epoch))
+        )
 
         if (
-            isinstance(last_epoch, (int, float))
+            not is_zero
+            and verified is True
+            and valid_last_epoch
             and -CLOCK_BACKWARD_TOLERANCE_SECONDS <= (now_epoch - float(last_epoch)) < JUST_ACTIVATED_WINDOW_SECONDS
-            and reset_utc is not None
             and locked_reset_utc is not None
+            and not is_zero_reset_sentinel(locked_reset_utc)
             and abs((reset_utc - locked_reset_utc).total_seconds()) <= 30
         ):
             return True, "pinned_reset_time_just_activated", meta
 
+        needs_unverified_cooldown = verified is False or (
+            verified is True and (locked_reset_utc is None or is_zero_reset_sentinel(locked_reset_utc))
+        )
         if (
-            verified is False
-            and isinstance(last_epoch, (int, float))
+            needs_unverified_cooldown
+            and valid_last_epoch
             and -CLOCK_BACKWARD_TOLERANCE_SECONDS <= (now_epoch - float(last_epoch)) < UNVERIFIED_COOLDOWN_SECONDS
         ):
             return True, "unverified_probe_cooldown", meta
 
+    if is_zero:
+        return False, "unactivated_zero_reset", meta
     return False, "unactivated_100pct", meta
 
 
@@ -931,6 +986,12 @@ def execute_run(args: argparse.Namespace) -> int:
         to_activate: List[Dict[str, Any]] = []
         probe_errors: List[str] = []
 
+        pool_bucket_ids: Dict[str, List[str]] = {}
+        for item in weekly_buckets:
+            pool_bucket_ids.setdefault(item["pool"], []).append(item["bucket_id"])
+        duplicate_pools = {p for p, bids in pool_bucket_ids.items() if len(bids) > 1}
+        handled_duplicate_pools = set()
+
         for item in weekly_buckets:
             pool = item["pool"]
             bid = item["bucket_id"]
@@ -947,6 +1008,15 @@ def execute_run(args: argparse.Namespace) -> int:
                     }
                 except Exception:
                     pools_report[pool] = {"bucket_id": bid, "action": "ignored_by_filter"}
+                continue
+
+            if pool in duplicate_pools:
+                if pool not in handled_duplicate_pools:
+                    handled_duplicate_pools.add(pool)
+                    dup_ids = ", ".join(pool_bucket_ids[pool])
+                    err_msg = f"duplicate weekly buckets for pool {pool!r}: {dup_ids}"
+                    probe_errors.append(f"{pool}: {err_msg}")
+                    pools_report[pool] = {"bucket_id": bid, "action": "error", "error": err_msg}
                 continue
 
             try:
@@ -974,40 +1044,97 @@ def execute_run(args: argparse.Namespace) -> int:
             missing_pool = target_pools[0]
             probe_errors.append(f"{missing_pool}: target weekly pool not present in `agy -p=/usage` output")
 
-        # Before waking any 100% candidate pool, re-check free `/usage` once after ~2s to
-        # verify `reset_time` is genuinely drifting forward rather than already locked
-        # (protects against sending an extra prompt right after a user's manual request,
-        # regardless of small clock skew between this host and Google's servers).
+        # Before waking any 100% candidate pool, re-check free `/usage` once after ~2.2s to
+        # confirm the pool stays consistently unactivated in the same mode (zero sentinel -> zero
+        # sentinel, or drifting within a valid 7-day window -> drifting forward). Any activation
+        # or cross-mode switch skips this cycle conservatively.
         if to_activate and not args.force:
             time.sleep(2.2)
             still_to_activate: List[Dict[str, Any]] = []
             try:
                 drift_payload, extra_att = fetch_usage_with_retries(agy_bin, env=env, retry_delays=[])
                 attempts += extra_att
-                drift_map = {x["pool"]: x["raw"] for x in extract_weekly_buckets(drift_payload)}
+                drift_buckets = extract_weekly_buckets(drift_payload)
+                drift_counts: Dict[str, int] = {}
+                drift_map: Dict[str, Dict[str, Any]] = {}
+                for x in drift_buckets:
+                    dp = x["pool"]
+                    drift_counts[dp] = drift_counts.get(dp, 0) + 1
+                    drift_map[dp] = x["raw"]
                 drift_utc = dt.datetime.now(dt.timezone.utc)
                 for item in to_activate:
                     pool = item["pool"]
+                    if drift_counts.get(pool, 0) > 1:
+                        err_msg = f"duplicate weekly buckets for pool {pool!r} during pre-wakeup confirmation"
+                        probe_errors.append(f"{pool}: {err_msg}")
+                        pools_report[pool]["action"] = "error"
+                        pools_report[pool]["error"] = err_msg
+                        continue
                     b2 = drift_map.get(pool)
                     if not b2:
                         probe_errors.append(f"{pool}: missing bucket during pre-wakeup drift confirmation")
                         pools_report[pool]["action"] = "error"
                         continue
-                    act2, rsn2, meta2 = evaluate_bucket_activity(b2, drift_utc, pool_states.get(pool))
-                    t1 = parse_iso_utc(item["raw"].get("reset_time"))
-                    t2 = parse_iso_utc(b2.get("reset_time"))
-                    if act2 or (t1 is not None and t2 is not None and t2 <= t1):
+                    r1 = pools_report[pool]["reason"]
+                    try:
+                        act2, rsn2, meta2 = evaluate_bucket_activity(b2, drift_utc, pool_states.get(pool))
+                    except ValueError as exc:
+                        probe_errors.append(f"{pool}: invalid bucket payload during pre-wakeup confirmation: {exc}")
+                        pools_report[pool]["action"] = "error"
+                        pools_report[pool]["error"] = str(exc)
+                        continue
+                    if act2:
                         pools_report[pool].update(
                             {
                                 "active_before": True,
-                                "reason": rsn2 if act2 else "reset_time_already_locked",
+                                "reason": rsn2,
                                 **meta2,
                             }
                         )
-                    else:
+                        continue
+
+                    if r1 == "unactivated_zero_reset" and rsn2 == "unactivated_zero_reset":
                         item["raw"] = b2
                         pools_report[pool].update(meta2)
                         still_to_activate.append(item)
+                    elif r1 == "unactivated_100pct" and rsn2 == "unactivated_100pct":
+                        t1 = parse_iso_utc(item["raw"].get("reset_time"))
+                        t2 = parse_iso_utc(b2.get("reset_time"))
+                        max_t1 = check_utc + dt.timedelta(seconds=WEEK_SECONDS + POST_WAKE_MAX_SKEW_SECONDS)
+                        max_t2 = drift_utc + dt.timedelta(seconds=WEEK_SECONDS + POST_WAKE_MAX_SKEW_SECONDS)
+                        if t1 is None or t2 is None or t1 > max_t1 or t2 > max_t2:
+                            pools_report[pool].update(
+                                {
+                                    "active_before": True,
+                                    "reason": "reset_time_out_of_range",
+                                    **meta2,
+                                }
+                            )
+                        elif t2 <= t1:
+                            pools_report[pool].update(
+                                {
+                                    "active_before": True,
+                                    "reason": "reset_time_already_locked",
+                                    **meta2,
+                                }
+                            )
+                        else:
+                            item["raw"] = b2
+                            pools_report[pool].update(meta2)
+                            still_to_activate.append(item)
+                    else:
+                        switch_reason = (
+                            "reset_time_already_locked"
+                            if r1 == "unactivated_zero_reset" and rsn2 == "unactivated_100pct"
+                            else "reset_time_mode_changed"
+                        )
+                        pools_report[pool].update(
+                            {
+                                "active_before": True,
+                                "reason": switch_reason,
+                                **meta2,
+                            }
+                        )
                 to_activate = still_to_activate
             except Exception as exc:
                 probe_errors.append(f"pre-wakeup drift confirmation failed: {exc}")
@@ -1054,6 +1181,25 @@ def execute_run(args: argparse.Namespace) -> int:
                 entry["selected_model"] = model_id
                 continue
 
+            # Persist unverified cooldown atomically BEFORE sending the wakeup request so
+            # timeouts, response parse errors, or interrupts still honor the 2h cooldown.
+            try:
+                pool_states[pool] = {
+                    "last_probe_epoch": time.time(),
+                    "last_probe_ts": fmt_iso(now_local()),
+                    "model": model_id,
+                    "verified_active": False,
+                    "locked_reset_time": None,
+                    "remaining_fraction_after": None,
+                }
+                atomic_write_json(state_path, state)
+            except Exception as exc:
+                err_msg = f"{pool} ({model_id}): failed to persist pre-wakeup cooldown state: {exc}"
+                probe_errors.append(err_msg)
+                entry["action"] = "error"
+                entry["error"] = str(exc)
+                continue
+
             try:
                 probe_res, wake_mode, primary_err = send_wakeup_request(agy_bin, model_id, env=env)
                 usage_obj = probe_res.get("usage") if isinstance(probe_res.get("usage"), dict) else {}
@@ -1071,17 +1217,6 @@ def execute_run(args: argparse.Namespace) -> int:
                 entry["action"] = "probed"
                 entry["probe"] = probe_info
                 sent_any_probe = True
-                # Persist immediately so the 2h unverified cooldown protects against
-                # repeat probes even if the subsequent `/usage` recheck fails or is interrupted.
-                pool_states[pool] = {
-                    "last_probe_epoch": time.time(),
-                    "last_probe_ts": fmt_iso(now_local()),
-                    "model": model_id,
-                    "verified_active": False,
-                    "locked_reset_time": None,
-                    "remaining_fraction_after": None,
-                }
-                atomic_write_json(state_path, state)
             except Exception as exc:
                 err_msg = f"{pool} ({model_id}): wakeup failed: {exc}"
                 probe_errors.append(err_msg)
@@ -1100,6 +1235,7 @@ def execute_run(args: argparse.Namespace) -> int:
                 after_payload, _ = fetch_usage_with_retries(agy_bin, env=env, retry_delays=[3.0])
                 after_buckets = {x["pool"]: x["raw"] for x in extract_weekly_buckets(after_payload)}
                 after_utc = dt.datetime.now(dt.timezone.utc)
+                sample_utc_by_pool: Dict[str, dt.datetime] = {}
                 needs_pin_recheck: List[str] = []
 
                 for item in to_activate:
@@ -1110,16 +1246,17 @@ def execute_run(args: argparse.Namespace) -> int:
                     after_b = after_buckets.get(pool)
                     if not after_b:
                         continue
+                    sample_utc_by_pool[pool] = after_utc
                     active_after, reason_after, meta_after = evaluate_bucket_activity(after_b, after_utc, None)
-                    if reason_after == "missing_reset_time":
-                        active_after = False
-                    entry["verified_active_after"] = active_after
+                    verified_after = active_after and (reason_after in VERIFIED_ACTIVE_REASONS)
+                    entry["verified_active_after"] = verified_after
                     entry["reason_after"] = reason_after
                     entry["remaining_pct_after"] = meta_after["remaining_pct"]
                     entry["reset_time_after"] = meta_after["reset_time"]
-                    if not active_after:
+                    if not verified_after:
                         needs_pin_recheck.append(pool)
 
+                needs_zero_jump_recheck: List[str] = []
                 if needs_pin_recheck:
                     time.sleep(3.0)
                     second_payload, _ = fetch_usage_with_retries(agy_bin, env=env, retry_delays=[2.0])
@@ -1131,25 +1268,57 @@ def execute_run(args: argparse.Namespace) -> int:
                         if not sec_b:
                             continue
                         active2, reason2, meta2 = evaluate_bucket_activity(sec_b, second_utc, None)
-                        if reason2 == "missing_reset_time":
-                            active2 = False
+                        verified2 = active2 and (reason2 in VERIFIED_ACTIVE_REASONS)
                         t1 = parse_iso_utc(first_b.get("reset_time"))
                         t2 = parse_iso_utc(sec_b.get("reset_time"))
-                        if (
-                            not active2
-                            and t1 is not None
-                            and t2 is not None
-                            and t2 > second_utc
-                            and abs((t2 - t1).total_seconds()) <= 1.0
-                        ):
-                            active2 = True
-                            reason2 = "reset_time_locked"
+                        if not verified2 and in_valid_post_wake_window(t2, second_utc):
+                            if (
+                                t1 is not None
+                                and not is_zero_reset_sentinel(t1)
+                                and abs((t2 - t1).total_seconds()) <= 1.0
+                            ):
+                                verified2 = True
+                                reason2 = "reset_time_locked"
+                            elif is_zero_reset_sentinel(t1):
+                                needs_zero_jump_recheck.append(pool)
                         after_buckets[pool] = sec_b
+                        sample_utc_by_pool[pool] = second_utc
                         entry = pools_report[pool]
-                        entry["verified_active_after"] = active2
+                        entry["verified_active_after"] = verified2
                         entry["reason_after"] = reason2
                         entry["remaining_pct_after"] = meta2["remaining_pct"]
                         entry["reset_time_after"] = meta2["reset_time"]
+
+                if needs_zero_jump_recheck:
+                    time.sleep(2.5)
+                    third_payload, _ = fetch_usage_with_retries(agy_bin, env=env, retry_delays=[2.0])
+                    third_buckets = {x["pool"]: x["raw"] for x in extract_weekly_buckets(third_payload)}
+                    third_utc = dt.datetime.now(dt.timezone.utc)
+                    for pool in needs_zero_jump_recheck:
+                        prev_b = after_buckets.get(pool) or {}
+                        third_b = third_buckets.get(pool)
+                        if not third_b:
+                            continue
+                        active3, reason3, meta3 = evaluate_bucket_activity(third_b, third_utc, None)
+                        verified3 = active3 and (reason3 in VERIFIED_ACTIVE_REASONS)
+                        t2 = parse_iso_utc(prev_b.get("reset_time"))
+                        t3 = parse_iso_utc(third_b.get("reset_time"))
+                        if (
+                            not verified3
+                            and in_valid_post_wake_window(t3, third_utc)
+                            and t2 is not None
+                            and not is_zero_reset_sentinel(t2)
+                            and abs((t3 - t2).total_seconds()) <= 1.0
+                        ):
+                            verified3 = True
+                            reason3 = "reset_time_locked"
+                        after_buckets[pool] = third_b
+                        sample_utc_by_pool[pool] = third_utc
+                        entry = pools_report[pool]
+                        entry["verified_active_after"] = verified3
+                        entry["reason_after"] = reason3
+                        entry["remaining_pct_after"] = meta3["remaining_pct"]
+                        entry["reset_time_after"] = meta3["reset_time"]
 
                 for item in to_activate:
                     pool = item["pool"]
@@ -1161,12 +1330,22 @@ def execute_run(args: argparse.Namespace) -> int:
                         probe_errors.append(f"{pool}: missing weekly bucket in post-wakeup /usage recheck")
                         continue
                     verified_now = bool(entry.get("verified_active_after"))
+                    after_reset_utc = parse_iso_utc(after_b.get("reset_time"))
+                    sample_utc = sample_utc_by_pool.get(pool, after_utc)
+                    locked_reset_to_save: Optional[str] = None
+                    if (
+                        verified_now
+                        and after_reset_utc is not None
+                        and not is_zero_reset_sentinel(after_reset_utc)
+                        and after_reset_utc > sample_utc
+                    ):
+                        locked_reset_to_save = after_b.get("reset_time")
                     pool_states[pool] = {
                         "last_probe_epoch": recheck_epoch,
                         "last_probe_ts": fmt_iso(now_local()),
                         "model": entry["probe"]["model"],
                         "verified_active": verified_now,
-                        "locked_reset_time": after_b.get("reset_time"),
+                        "locked_reset_time": locked_reset_to_save,
                         "remaining_fraction_after": after_b.get("remaining_fraction"),
                     }
                     if not verified_now:
@@ -1845,8 +2024,17 @@ def format_record_line(rec: Dict[str, Any]) -> str:
             info = pools.get(pkey)
             if not isinstance(info, dict):
                 continue
-            pct = info.get("remaining_pct_after", info.get("remaining_pct", "?"))
-            rst = info.get("reset_time_after", info.get("reset_time", "?"))
+            has_after = "reset_time_after" in info
+            pct = info.get("remaining_pct_after") if has_after else info.get("remaining_pct", "?")
+            if pct is None:
+                pct = info.get("remaining_pct", "?")
+            raw_rst = info.get("reset_time_after") if has_after else info.get("reset_time")
+            eff_reason = info.get("reason_after") if has_after else info.get("reason")
+            parsed_rst = parse_iso_utc(raw_rst) if isinstance(raw_rst, str) else None
+            if not raw_rst or is_zero_reset_sentinel(parsed_rst):
+                rst = "unactivated" if eff_reason == "unactivated_zero_reset" else "-"
+            else:
+                rst = str(raw_rst)
             act = info.get("action", "none")
             if act == "probed":
                 probe_meta = info.get("probe") or {}
@@ -1948,11 +2136,11 @@ def execute_status(args: argparse.Namespace) -> int:
         print("Logs: no runs recorded yet.")
         return 0
 
-    activations = [r for r in records if record_has_probe(r)]
+    probes = [r for r in records if record_has_probe(r)]
     errors = [r for r in records if r.get("status") in ("error", "partial_error")]
-    print(f"Total recorded runs: {len(records)} | Activations: {len(activations)} | Errors: {len(errors)}")
-    if activations:
-        print(f"Last activation: {format_record_line(activations[-1])}")
+    print(f"Total recorded runs: {len(records)} | Wakeup probes: {len(probes)} | Errors: {len(errors)}")
+    if probes:
+        print(f"Last probe:      {format_record_line(probes[-1])}")
     if errors:
         print(f"Last error:      {format_record_line(errors[-1])}")
 

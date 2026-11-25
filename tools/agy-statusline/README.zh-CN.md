@@ -15,7 +15,7 @@
 1. **cwd**：当前工作目录，支持按最长前缀缩写自定义别名（`AGY_STATUSLINE_PATH_ALIASES`），未命中时将 `$HOME` 缩写为 `~`。
 2. **model**：当前模型名，自动剥离 `Claude ` / `Gemini ` / `GPT ` 前缀与尾部思考强度标记。
 3. **effort**：当前思考强度（`low`、`medium`、`high`、`xhigh`、`max`）。
-4. **context 用量**：上下文已用/总量（`k`/`M`）、百分比以及压缩次数 `⛁ N`。
+4. **context 用量**：上下文已用/总量（`k`/`M`）、百分比以及压缩次数 `⛁ N`。若设置了有效的 `AGY_CLI_AUTO_COMPACT_OVERRIDE` 且小于模型 `context_window_size`，自动以该压缩阈值作为分母并重算百分比；等于模型窗口时保留 payload 原百分比。
 5. **quota 配额**：独立展示 Gemini 池（`G:`）7 天与 5 小时用量及重置倒计时/时刻，以及第三方/Claude 池（`C:`）7 天用量与重置倒计时。
 6. **git 分支**：位于 git 工作树时展示当前分支名或 detached HEAD 短哈希（`git` 为可选依赖）。
 7. **cost**：当输入 JSON 提供费用字段时展示会话美元花费。
@@ -66,6 +66,7 @@ python3 tools/agy-statusline/test_agy_statusline.py -v
 | `AGY_STATUSLINE_STATE_DIR` | `$HOME/.gemini/antigravity-cli` | 状态根目录，统一用于 transcript 兜底读取、`quota-cache.json` 与默认 `quota-log.jsonl` 落点，支持前导 `~/` 展开。 |
 | `AGY_STATUSLINE_PATH_ALIASES` | *（空）* | 用冒号 `:` 分隔的多条 `prefix=alias` 路径缩写规则（如 `~/work/my-repo=~/MR:~/projects/app=~/APP`）。左侧前导 `~`/`~/` 按 `$HOME` 展开，按前缀长度从长到短匹配，严格遵守目录边界（`/foo/bar` 不会误匹配 `/foo/bar2`）。 |
 | `AGY_STATUSLINE_QUOTA_LOG` | *（关闭）* | 配额变更历史日志开关。未设置、为空、`0` 或 `false`（大小写不敏感）均关闭；设为 `1` 或 `true` 写入 `${AGY_STATUSLINE_STATE_DIR}/quota-log.jsonl`；设为其他非空值则视为自定义目标文件路径（支持前导 `~/` 展开，自动创建父目录）。相邻相同快照自动去重。 |
+| `AGY_CLI_AUTO_COMPACT_OVERRIDE` | *（未设置）* | `agy` 原生的自动压缩阈值环境变量（支持纯整数 `350000`、`K`/`M` 简写如 `800K`/`0.5M` 或百分比 `80%`）。由于 `agy` 当前状态栏 JSON 只提供模型完整 `context_window_size`，设置该变量且小于模型上限时，脚本会以它作为分母并重算上下文占比；等于模型窗口时保留 payload 原百分比；未设置、非法或超出上限时自动回退显示模型总窗口。 |
 
 ## 本地状态与缓存文件
 

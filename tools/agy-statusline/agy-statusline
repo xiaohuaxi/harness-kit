@@ -21,7 +21,9 @@ FALLBACK_CWD="$(pwd)"
 # ── Extract fields in one Python pass and eval into shell variables ──────────
 eval "$(FALLBACK_CWD="$FALLBACK_CWD" python3 -c '
 import datetime
+from fractions import Fraction
 import json
+import math
 import os
 import re
 import sys
@@ -81,19 +83,37 @@ def format_cwd_display(cwd, aliases_raw):
     return cwd
 
 
+ISO_RFC3339_RE = re.compile(
+    r"([0-9]{4}-[0-9]{2}-[0-9]{2})[Tt ]((?:[01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9])"
+    r"(?:\.([0-9]+))?(?:([Zz])|([+-])([01][0-9]|2[0-3]):?([0-5][0-9]))?"
+)
+ZERO_RESET_SENTINEL_UTC = datetime.datetime(1970, 1, 2, tzinfo=datetime.timezone.utc)
+
+
 def parse_iso_dt(rt):
-    if not isinstance(rt, str) or not rt:
+    if not isinstance(rt, str):
         return None
-    s = rt.strip()
-    if s.endswith(("Z", "z")):
-        s = s[:-1] + "+00:00"
-    # Normalize fractional seconds and ±HHMM offset for Python 3.7-3.10 fromisoformat compatibility.
-    s = re.sub(r"([+-]\d{2})(\d{2})$", r"\1:\2", s)
-    m = re.match(r"^(\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2})\.(\d+)(.*)$", s)
-    if m:
-        frac = (m.group(2) + "000000")[:6]
-        s = f"{m.group(1)}.{frac}{m.group(3)}"
-    return datetime.datetime.fromisoformat(s).astimezone()
+    m = ISO_RFC3339_RE.fullmatch(rt.strip())
+    if not m:
+        return None
+    date_part, time_part, frac_part, z_part, sign_part, tz_h, tz_m = m.groups()
+    iso = f"{date_part}T{time_part}"
+    if frac_part is not None:
+        iso += "." + frac_part[:6].ljust(6, "0")
+    iso += "+00:00" if (z_part is not None or sign_part is None) else f"{sign_part}{tz_h}:{tz_m}"
+    try:
+        parsed = datetime.datetime.fromisoformat(iso)
+    except ValueError:
+        return None
+    if parsed.year <= 2:
+        return None
+    try:
+        utc_dt = parsed.astimezone(datetime.timezone.utc)
+        if utc_dt <= ZERO_RESET_SENTINEL_UTC:
+            return None
+        return utc_dt.astimezone()
+    except OverflowError:
+        return None
 
 
 def as_str(val):
@@ -117,6 +137,52 @@ def fmt_tokens(n):
     if n >= 1000:
         return f"{n // 1000}k"
     return str(n)
+
+
+def parse_unsigned_decimal_fraction(raw):
+    # Match agy store.parseUnsignedDecimalRat: unsigned ASCII decimal without sign/exponent.
+    if not raw or not re.fullmatch(r"[0-9]+(?:\.[0-9]*)?|\.[0-9]+", raw):
+        return None
+    try:
+        val = Fraction(raw)
+    except Exception:
+        return None
+    return val if val > 0 else None
+
+
+def parse_auto_compact_override(raw, max_tokens):
+    """Mirror agy AGY_CLI_AUTO_COMPACT_OVERRIDE parsing (integer, K/M shorthand, or %)."""
+    if not raw or max_tokens <= 0:
+        return None
+    spec = raw.strip()
+    if not spec:
+        return None
+
+    max_u32 = 0xFFFFFFFF
+    if spec.endswith("%"):
+        pct_val = parse_unsigned_decimal_fraction(spec[:-1])
+        if pct_val is None or pct_val > 100:
+            return None
+        frac = pct_val * max_tokens / 100
+        tokens = frac.numerator // frac.denominator
+    elif spec[-1] in ("k", "K", "m", "M"):
+        mult = 1000 if spec[-1] in ("k", "K") else 1_000_000
+        num = parse_unsigned_decimal_fraction(spec[:-1])
+        if num is None:
+            return None
+        frac = num * mult
+        tokens = frac.numerator // frac.denominator
+    elif spec.isascii() and spec.isdigit():
+        try:
+            tokens = int(spec)
+        except ValueError:
+            return None
+    else:
+        return None
+
+    if tokens <= 0 or tokens > max_u32 or tokens > max_tokens:
+        return None
+    return tokens
 
 
 def atomic_write_json(path, payload):
@@ -198,6 +264,17 @@ if used == 0:
     used = as_int(cw.get("total_input_tokens"))
 total = as_int(cw.get("context_window_size"))
 pct = cw.get("used_percentage")
+# agy statusLine payload currently reports the full model context_window_size without
+# exposing the active auto-compaction threshold. When AGY_CLI_AUTO_COMPACT_OVERRIDE is
+# valid and smaller than context_window_size, display it as the effective denominator
+# and recompute used percentage against it (equal keeps the payload percentage).
+compact_override = parse_auto_compact_override(
+    os.environ.get("AGY_CLI_AUTO_COMPACT_OVERRIDE", ""),
+    total,
+)
+if compact_override is not None and compact_override < total:
+    total = compact_override
+    pct = (used / total) * 100.0 if used > 0 else None
 
 compacts = 0
 tp = as_str(d.get("transcript_path"))
@@ -212,6 +289,22 @@ if tp:
     except Exception:
         compacts = 0
 
+def has_reset_time_str(b):
+    rt = b.get("reset_time")
+    return isinstance(rt, str) and bool(rt.strip())
+
+
+def parse_positive_reset_seconds(b):
+    ris = b.get("reset_in_seconds")
+    if isinstance(ris, bool) or ris is None:
+        return None
+    try:
+        secs = float(ris)
+    except Exception:
+        return None
+    return secs if (math.isfinite(secs) and secs > 0) else None
+
+
 def normalize_quota_for_cache(quota):
     now_ts = time.time()
     normalized = {}
@@ -220,22 +313,15 @@ def normalize_quota_for_cache(quota):
             normalized[k] = v
             continue
         item = dict(v)
-        has_valid_rt = False
-        if isinstance(item.get("reset_time"), str) and item["reset_time"].strip():
-            try:
-                has_valid_rt = parse_iso_dt(item["reset_time"]) is not None
-            except Exception:
-                has_valid_rt = False
-        ris = item.get("reset_in_seconds")
-        if not has_valid_rt and not isinstance(ris, bool) and ris is not None:
-            try:
-                secs = float(ris)
-                if secs > 0:
+        if not has_reset_time_str(item):
+            secs = parse_positive_reset_seconds(item)
+            if secs is not None:
+                try:
                     target_dt = datetime.datetime.fromtimestamp(now_ts + secs, tz=datetime.timezone.utc)
                     item["reset_time"] = target_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
                     item.pop("reset_in_seconds", None)
-            except Exception:
-                pass
+                except Exception:
+                    pass
         normalized[k] = item
     return normalized
 
@@ -275,39 +361,30 @@ def parse_bucket(b, mode="clock"):
         except Exception:
             b_pct = None
     reset = ""
-    rt = b.get("reset_time")
-    if mode == "days":
-        if rt:
-            try:
-                dt = parse_iso_dt(rt)
-                if dt is not None:
-                    now = datetime.datetime.now().astimezone()
+    if has_reset_time_str(b):
+        try:
+            dt = parse_iso_dt(b["reset_time"])
+            if dt is not None:
+                now = datetime.datetime.now().astimezone()
+                if mode == "days":
                     days = max(0.0, (dt - now).total_seconds() / 86400.0)
                     reset = f"{days:.1f}d"
-            except Exception:
-                pass
-        elif b.get("reset_in_seconds") is not None:
-            try:
-                days = max(0.0, float(b["reset_in_seconds"]) / 86400.0)
-                reset = f"{days:.1f}d"
-            except Exception:
-                pass
-    else:
-        if rt:
-            try:
-                dt = parse_iso_dt(rt)
-                if dt is not None:
-                    now = datetime.datetime.now().astimezone()
+                else:
                     same_day = dt.date() == now.date()
                     reset = dt.strftime("%H:%M" if same_day else "%m-%d %H:%M")
-            except Exception:
-                pass
-        elif b.get("reset_in_seconds") is not None:
+        except Exception:
+            pass
+    else:
+        secs = parse_positive_reset_seconds(b)
+        if secs is not None:
             try:
-                target_ts = time.time() + float(b["reset_in_seconds"])
-                lt = time.localtime(target_ts)
-                same_day = time.strftime("%Y%m%d", lt) == time.strftime("%Y%m%d")
-                reset = time.strftime("%H:%M" if same_day else "%m-%d %H:%M", lt)
+                if mode == "days":
+                    reset = f"{secs / 86400.0:.1f}d"
+                else:
+                    target_ts = time.time() + secs
+                    lt = time.localtime(target_ts)
+                    same_day = time.strftime("%Y%m%d", lt) == time.strftime("%Y%m%d")
+                    reset = time.strftime("%H:%M" if same_day else "%m-%d %H:%M", lt)
             except Exception:
                 pass
     return b_pct, reset

@@ -524,6 +524,9 @@ class AgyQuotaWakeupTests(unittest.TestCase):
             fake_agy.write_text("#!/bin/sh\necho '1.5.11'\n", encoding="utf-8")
             fake_agy.chmod(0o755)
 
+            real_now = dt.datetime.now(dt.timezone.utc)
+            drift_t1 = (real_now + dt.timedelta(days=7, seconds=10)).strftime("%Y-%m-%dT%H:%M:%SZ")
+            drift_t2 = (real_now + dt.timedelta(days=7, seconds=13)).strftime("%Y-%m-%dT%H:%M:%SZ")
             unactivated_t1 = {
                 "status": "SUCCESS",
                 "command": {
@@ -537,7 +540,7 @@ class AgyQuotaWakeupTests(unittest.TestCase):
                                         "id": "gemini-weekly",
                                         "window": "weekly",
                                         "remaining_fraction": 1.0,
-                                        "reset_time": "2099-01-01T00:00:00Z",
+                                        "reset_time": drift_t1,
                                     }
                                 ],
                             }
@@ -558,7 +561,7 @@ class AgyQuotaWakeupTests(unittest.TestCase):
                                         "id": "gemini-weekly",
                                         "window": "weekly",
                                         "remaining_fraction": 1.0,
-                                        "reset_time": "2099-01-01T00:00:03Z",
+                                        "reset_time": drift_t2,
                                     }
                                 ],
                             }
@@ -1102,6 +1105,696 @@ class AgyQuotaWakeupTests(unittest.TestCase):
             rec = json.loads(out_buf.getvalue().strip())
             self.assertEqual(rec["status"], "ok")
             self.assertEqual(rec["duration_ms"], 250)
+
+    def test_parse_iso_utc_and_zero_sentinel_full_branch_coverage(self) -> None:
+        # 1) Valid RFC 3339 variants: separators, fractional lengths, timezone forms
+        valid_cases = [
+            ("2026-11-25T02:02:41Z", dt.datetime(2026, 11, 25, 2, 2, 41, tzinfo=dt.timezone.utc)),
+            ("2026-11-25t02:02:41z", dt.datetime(2026, 11, 25, 2, 2, 41, tzinfo=dt.timezone.utc)),
+            ("2026-11-25 02:02:41", dt.datetime(2026, 11, 25, 2, 2, 41, tzinfo=dt.timezone.utc)),
+            ("  2026-11-25T02:02:41Z  ", dt.datetime(2026, 11, 25, 2, 2, 41, tzinfo=dt.timezone.utc)),
+            ("2026-11-25T02:02:41.5Z", dt.datetime(2026, 11, 25, 2, 2, 41, 500000, tzinfo=dt.timezone.utc)),
+            ("2026-11-25T02:02:41.12Z", dt.datetime(2026, 11, 25, 2, 2, 41, 120000, tzinfo=dt.timezone.utc)),
+            ("2026-11-25T02:02:41.123Z", dt.datetime(2026, 11, 25, 2, 2, 41, 123000, tzinfo=dt.timezone.utc)),
+            ("2026-11-25T02:02:41.123456Z", dt.datetime(2026, 11, 25, 2, 2, 41, 123456, tzinfo=dt.timezone.utc)),
+            ("2026-11-25T02:02:41.123456789Z", dt.datetime(2026, 11, 25, 2, 2, 41, 123456, tzinfo=dt.timezone.utc)),
+            ("2026-11-25T10:02:41+08:00", dt.datetime(2026, 11, 25, 2, 2, 41, tzinfo=dt.timezone.utc)),
+            ("2026-11-25T10:02:41+0800", dt.datetime(2026, 11, 25, 2, 2, 41, tzinfo=dt.timezone.utc)),
+            ("2026-11-24T18:32:41-07:30", dt.datetime(2026, 11, 25, 2, 2, 41, tzinfo=dt.timezone.utc)),
+            ("2026-11-24T18:32:41.7-0730", dt.datetime(2026, 11, 25, 2, 2, 41, 700000, tzinfo=dt.timezone.utc)),
+            ("2024-02-29T12:00:00-00:00", dt.datetime(2024, 2, 29, 12, 0, 0, tzinfo=dt.timezone.utc)),
+            ("2026-11-25T00:00:00+23:59", dt.datetime(2026, 11, 24, 0, 1, 0, tzinfo=dt.timezone.utc)),
+            ("2026-11-25T00:00:00-23:59", dt.datetime(2026, 11, 25, 23, 59, 0, tzinfo=dt.timezone.utc)),
+        ]
+        for raw, expected in valid_cases:
+            parsed = mod.parse_iso_utc(raw)
+            self.assertEqual(parsed, expected, f"raw={raw!r}")
+            self.assertFalse(mod.is_zero_reset_sentinel(parsed), f"raw={raw!r}")
+
+        # 2) Zero / epoch sentinels & year <= 2 underflow protection
+        sentinel_cases = [
+            "1970-01-01T00:00:00Z",
+            "1970-01-01T08:00:00+08:00",
+            "1969-12-31T19:00:00-05:00",
+            "1970-01-02T00:00:00Z",  # inclusive upper bound
+            "1960-05-01T00:00:00Z",
+            "0001-01-01T00:00:00Z",
+            "0001-01-01T00:00:00+08:00",  # would underflow without year <= 2 guard
+            "0002-01-01T00:00:00+08:00",
+        ]
+        for raw in sentinel_cases:
+            parsed = mod.parse_iso_utc(raw)
+            self.assertIsNotNone(parsed, f"raw={raw!r}")
+            self.assertTrue(mod.is_zero_reset_sentinel(parsed), f"raw={raw!r}")
+
+        self.assertEqual(
+            mod.parse_iso_utc("0001-01-01T00:00:00+08:00"),
+            dt.datetime(1, 1, 1, tzinfo=dt.timezone.utc),
+        )
+        just_after_sentinel = mod.parse_iso_utc("1970-01-02T00:00:01Z")
+        self.assertIsNotNone(just_after_sentinel)
+        self.assertFalse(mod.is_zero_reset_sentinel(just_after_sentinel))
+        self.assertFalse(mod.is_zero_reset_sentinel(None))
+
+        # 3) Overflow on year 9999 + invalid/malformed inputs return None
+        invalid_cases = [
+            None,
+            123,
+            True,
+            [],
+            {},
+            "",
+            "   ",
+            "2026-11-25",
+            "2026-11-25T02:02Z",
+            "2026-11-25  02:02:41Z",
+            "2026-11-25\t02:02:41Z",
+            "2026-11-25T02:02:41 Z",
+            "2026-11-25T02:02:41.Z",
+            "2026-11-25T02:02:41Z garbage",
+            "2026-11-25T02:02:41Z\nmore",
+            "２０２６-11-25T02:02:41Z",
+            "2026-02-30T00:00:00Z",
+            "2026-13-01T00:00:00Z",
+            "2026-11-25T24:00:00Z",
+            "2026-11-25T02:60:00Z",
+            "0000-01-01T00:00:00Z",
+            "2026-11-25T02:02:41+24:00",
+            "2026-11-25T02:02:41-24:00",
+            "2026-11-25T02:02:41+25:00",
+            "2026-11-25T02:02:41+08:60",
+            "2026-11-25T02:02:41-01:99",
+            "2026-11-25T02:02:41+08",
+            "9999-12-31T23:59:59-08:00",  # UTC conversion overflow
+        ]
+        for raw in invalid_cases:
+            self.assertIsNone(mod.parse_iso_utc(raw), f"expected None for {raw!r}")
+
+    def test_evaluate_bucket_activity_segments_and_validation(self) -> None:
+        now_utc = dt.datetime(2026, 11, 25, 12, 0, 0, tzinfo=dt.timezone.utc)
+
+        # Segment 1: zero/epoch sentinels -> unactivated_zero_reset with clean None metadata
+        for zero_rt in (
+            "1970-01-01T00:00:00Z",
+            "1970-01-01T08:00:00+08:00",
+            "1969-12-31T19:00:00-05:00",
+            "0001-01-01T00:00:00Z",
+            "0001-01-01T00:00:00+08:00",
+        ):
+            active, reason, meta = mod.evaluate_bucket_activity(
+                {"id": "3p-weekly", "window": "weekly", "remaining_fraction": 1.0, "reset_time": zero_rt},
+                now_utc,
+            )
+            self.assertFalse(active, f"zero_rt={zero_rt!r}")
+            self.assertEqual(reason, "unactivated_zero_reset", f"zero_rt={zero_rt!r}")
+            self.assertIsNone(meta["reset_time"], f"zero_rt={zero_rt!r}")
+            self.assertIsNone(meta["seconds_until_reset"], f"zero_rt={zero_rt!r}")
+
+        # Segment 2: 1970-01-02 UTC < reset_time <= now_utc -> reset_time_expired_pending
+        for expired_rt in (
+            "1970-01-02T00:00:01Z",
+            "2026-11-25T11:59:59Z",
+            "2026-11-25T12:00:00Z",  # inclusive boundary == now_utc
+        ):
+            active, reason, _ = mod.evaluate_bucket_activity(
+                {"id": "3p-weekly", "window": "weekly", "remaining_fraction": 1.0, "reset_time": expired_rt},
+                now_utc,
+            )
+            self.assertTrue(active, f"expired_rt={expired_rt!r}")
+            self.assertEqual(reason, "reset_time_expired_pending", f"expired_rt={expired_rt!r}")
+
+        # Segment 3: now_utc < reset_time < now_utc + 7d - grace -> reset_timer_counting_down
+        for active_rt in (
+            "2026-11-25T12:00:01Z",
+            (now_utc + dt.timedelta(seconds=mod.WEEK_SECONDS - mod.COUNTDOWN_GRACE_SECONDS - 1)).strftime(
+                "%Y-%m-%dT%H:%M:%SZ"
+            ),
+        ):
+            active, reason, _ = mod.evaluate_bucket_activity(
+                {"id": "3p-weekly", "window": "weekly", "remaining_fraction": 1.0, "reset_time": active_rt},
+                now_utc,
+            )
+            self.assertTrue(active, f"active_rt={active_rt!r}")
+            self.assertEqual(reason, "reset_timer_counting_down", f"active_rt={active_rt!r}")
+
+        # Segment 4: >= now_utc + 7d - grace -> unactivated_100pct
+        boundary_rt = (now_utc + dt.timedelta(seconds=mod.WEEK_SECONDS - mod.COUNTDOWN_GRACE_SECONDS)).strftime(
+            "%Y-%m-%dT%H:%M:%SZ"
+        )
+        active4, reason4, _ = mod.evaluate_bucket_activity(
+            {"id": "3p-weekly", "window": "weekly", "remaining_fraction": 1.0, "reset_time": boundary_rt},
+            now_utc,
+        )
+        self.assertFalse(active4)
+        self.assertEqual(reason4, "unactivated_100pct")
+
+        # Exhausted omitted remaining_fraction WITH zero sentinel must still be exhausted_0pct (never wake)
+        active_ex, reason_ex, meta_ex = mod.evaluate_bucket_activity(
+            {"id": "3p-weekly", "window": "weekly", "reset_time": "1970-01-01T00:00:00Z"},
+            now_utc,
+        )
+        self.assertTrue(active_ex)
+        self.assertEqual(reason_ex, "exhausted_0pct")
+        self.assertIsNone(meta_ex["reset_time"])
+        self.assertEqual(meta_ex["remaining_pct"], 0.0)
+
+        # Explicit 0.0 remaining_fraction WITH zero sentinel -> remaining_below_100pct
+        active_0, reason_0, _ = mod.evaluate_bucket_activity(
+            {"id": "3p-weekly", "window": "weekly", "remaining_fraction": 0.0, "reset_time": "1970-01-01T00:00:00Z"},
+            now_utc,
+        )
+        self.assertTrue(active_0)
+        self.assertEqual(reason_0, "remaining_below_100pct")
+
+        # Missing remaining_fraction with neither reset_time nor description raises ValueError
+        with self.assertRaises(ValueError):
+            mod.evaluate_bucket_activity({"id": "3p-weekly", "window": "weekly"}, now_utc)
+
+        # Invalid remaining_fraction values (bool, NaN, inf, out-of-range) raise ValueError
+        for bad_rem in (True, False, float("nan"), float("inf"), float("-inf"), 1.5, -0.1, "not-a-num"):
+            with self.assertRaises(ValueError, msg=f"bad_rem={bad_rem!r}"):
+                mod.evaluate_bucket_activity(
+                    {
+                        "id": "3p-weekly",
+                        "window": "weekly",
+                        "remaining_fraction": bad_rem,
+                        "reset_time": "1970-01-01T00:00:00Z",
+                    },
+                    now_utc,
+                )
+
+    def test_state_cooldown_and_pinned_guards_for_zero_and_legacy_dirty_state(self) -> None:
+        t0 = dt.datetime(2026, 11, 25, 10, 0, 0, tzinfo=dt.timezone.utc)
+        zero_bucket = {
+            "id": "3p-weekly",
+            "window": "weekly",
+            "remaining_fraction": 1.0,
+            "reset_time": "1970-01-01T00:00:00Z",
+        }
+        drift_rt = (t0 + dt.timedelta(days=7, minutes=2)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        drift_bucket = {
+            "id": "3p-weekly",
+            "window": "weekly",
+            "remaining_fraction": 1.0,
+            "reset_time": drift_rt,
+        }
+
+        # 1) Unverified cooldown applies to zero-sentinel buckets (<2h skip, >=2h retry)
+        unverified_state = {
+            "last_probe_epoch": t0.timestamp(),
+            "locked_reset_time": None,
+            "verified_active": False,
+        }
+        act1, rsn1, _ = mod.evaluate_bucket_activity(zero_bucket, t0 + dt.timedelta(hours=1), unverified_state)
+        self.assertTrue(act1)
+        self.assertEqual(rsn1, "unverified_probe_cooldown")
+
+        act2, rsn2, _ = mod.evaluate_bucket_activity(zero_bucket, t0 + dt.timedelta(hours=2, seconds=1), unverified_state)
+        self.assertFalse(act2)
+        self.assertEqual(rsn2, "unactivated_zero_reset")
+
+        # 2) Legacy dirty state.json (verified_active=True + zero locked_reset_time) triggers 2h cooldown
+        dirty_legacy_state = {
+            "last_probe_epoch": t0.timestamp(),
+            "locked_reset_time": "1970-01-01T00:00:00Z",
+            "verified_active": True,
+        }
+        act_d1, rsn_d1, _ = mod.evaluate_bucket_activity(zero_bucket, t0 + dt.timedelta(minutes=3), dirty_legacy_state)
+        self.assertTrue(act_d1)
+        self.assertEqual(rsn_d1, "unverified_probe_cooldown")
+
+        act_d2, rsn_d2, _ = mod.evaluate_bucket_activity(drift_bucket, t0 + dt.timedelta(minutes=3), dirty_legacy_state)
+        self.assertTrue(act_d2)
+        self.assertEqual(rsn_d2, "unverified_probe_cooldown")
+
+        # 3) pinned_reset_time_just_activated rejects verified_active=False even if locked_reset_time matches
+        unverified_matching_state = {
+            "last_probe_epoch": t0.timestamp(),
+            "locked_reset_time": drift_rt,
+            "verified_active": False,
+        }
+        act_p, rsn_p, _ = mod.evaluate_bucket_activity(drift_bucket, t0 + dt.timedelta(minutes=2), unverified_matching_state)
+        self.assertTrue(act_p)
+        self.assertEqual(rsn_p, "unverified_probe_cooldown")
+
+    def test_execute_run_zero_sentinel_pre_persist_recheck_and_cross_mode(self) -> None:
+        def make_usage(reset_time: str, rem: float = 1.0, pool: str = "3p") -> dict:
+            gid = "3p-weekly" if pool == "3p" else "gemini-weekly"
+            gname = "Claude and GPT models" if pool == "3p" else "Gemini Models"
+            return {
+                "status": "SUCCESS",
+                "command": {
+                    "name": "usage",
+                    "data": {
+                        "groups": [
+                            {
+                                "name": gname,
+                                "buckets": [
+                                    {
+                                        "id": gid,
+                                        "window": "weekly",
+                                        "remaining_fraction": rem,
+                                        "reset_time": reset_time,
+                                    }
+                                ],
+                            }
+                        ]
+                    },
+                },
+            }
+
+        ok_probe = ({"status": "SUCCESS", "response": "OK", "usage": {"total_tokens": 500}}, "chat_only", None)
+
+        with tempfile.TemporaryDirectory() as td:
+            d = Path(td)
+            fake_agy = d / "agy"
+            fake_agy.write_text("#!/bin/sh\necho '1.5.11'\n", encoding="utf-8")
+            fake_agy.chmod(0o755)
+
+            zero_u = make_usage("1970-01-01T00:00:00Z")
+
+            # Case 1: Pre-send state persistence: even if send_wakeup_request raises/times out, state.json has verified_active=False
+            st1 = d / "st1"
+            with mock.patch.dict(os.environ, {"AGY_QUOTA_WAKEUP_STATE_DIR": str(st1)}):
+                with mock.patch.object(mod.time, "sleep"):
+                    with mock.patch.object(mod, "fetch_usage_with_retries", side_effect=[(zero_u, 1), (zero_u, 1)]):
+                        with mock.patch.object(
+                            mod, "fetch_available_models", return_value=[("claude-sonnet-5-5-low", "Sonnet Low")]
+                        ):
+                            with mock.patch.object(
+                                mod, "send_wakeup_request", side_effect=subprocess.TimeoutExpired(["agy"], 90)
+                            ):
+                                with redirect_stderr(io.StringIO()):
+                                    rc1 = mod.main(["run", "--pools", "3p", "--agy-bin", str(fake_agy)])
+            self.assertEqual(rc1, 1)
+            saved1 = mod.load_json_dict(st1 / "state.json")
+            self.assertIn("3p", saved1.get("pools", {}))
+            self.assertIs(saved1["pools"]["3p"]["verified_active"], False)
+            self.assertIsNone(saved1["pools"]["3p"]["locked_reset_time"])
+
+            # Case 2: zero -> zero confirmed -> wakeup -> +1s jumped to future & +4s locked (no 3rd recheck needed)
+            st2 = d / "st2"
+            now_utc = dt.datetime.now(dt.timezone.utc)
+            locked_rt = (now_utc + dt.timedelta(days=7)).strftime("%Y-%m-%dT%H:%M:%SZ")
+            locked_u = make_usage(locked_rt)
+            out2 = io.StringIO()
+            with mock.patch.dict(os.environ, {"AGY_QUOTA_WAKEUP_STATE_DIR": str(st2)}):
+                with mock.patch.object(mod.time, "sleep"):
+                    with mock.patch.object(
+                        mod,
+                        "fetch_usage_with_retries",
+                        side_effect=[(zero_u, 1), (zero_u, 1), (locked_u, 1), (locked_u, 1)],
+                    ) as mock_fetch2:
+                        with mock.patch.object(
+                            mod, "fetch_available_models", return_value=[("claude-sonnet-5-5-low", "Sonnet Low")]
+                        ):
+                            with mock.patch.object(mod, "send_wakeup_request", return_value=ok_probe):
+                                with redirect_stdout(out2):
+                                    rc2 = mod.main(["run", "--pools", "3p", "--agy-bin", str(fake_agy)])
+            self.assertEqual(rc2, 0)
+            self.assertEqual(mock_fetch2.call_count, 4)
+            rec2 = json.loads(out2.getvalue().strip())
+            self.assertEqual(rec2["status"], "activated")
+            self.assertTrue(rec2["pools"]["3p"]["verified_active_after"])
+            self.assertEqual(rec2["pools"]["3p"]["reason_after"], "reset_time_locked")
+            saved2 = mod.load_json_dict(st2 / "state.json")
+            self.assertIs(saved2["pools"]["3p"]["verified_active"], True)
+            self.assertEqual(saved2["pools"]["3p"]["locked_reset_time"], locked_rt)
+
+            # Case 3a: +1s still zero -> +4s jumps to future window -> 3rd conditional recheck locks -> verified_active=True
+            st3a = d / "st3a"
+            out3a = io.StringIO()
+            with mock.patch.dict(os.environ, {"AGY_QUOTA_WAKEUP_STATE_DIR": str(st3a)}):
+                with mock.patch.object(mod.time, "sleep"):
+                    with mock.patch.object(
+                        mod,
+                        "fetch_usage_with_retries",
+                        side_effect=[(zero_u, 1), (zero_u, 1), (zero_u, 1), (locked_u, 1), (locked_u, 1)],
+                    ) as mock_fetch3a:
+                        with mock.patch.object(
+                            mod, "fetch_available_models", return_value=[("claude-sonnet-5-5-low", "Sonnet Low")]
+                        ):
+                            with mock.patch.object(mod, "send_wakeup_request", return_value=ok_probe):
+                                with redirect_stdout(out3a):
+                                    rc3a = mod.main(["run", "--pools", "3p", "--agy-bin", str(fake_agy)])
+            self.assertEqual(rc3a, 0)
+            self.assertEqual(mock_fetch3a.call_count, 5)
+            rec3a = json.loads(out3a.getvalue().strip())
+            self.assertEqual(rec3a["status"], "activated")
+            self.assertEqual(rec3a["pools"]["3p"]["reason_after"], "reset_time_locked")
+            saved3a = mod.load_json_dict(st3a / "state.json")
+            self.assertIs(saved3a["pools"]["3p"]["verified_active"], True)
+            self.assertEqual(saved3a["pools"]["3p"]["locked_reset_time"], locked_rt)
+
+            # Case 3b: +1s still zero -> +4s jumps to future window -> 3rd recheck keeps drifting -> verified_active=False
+            st3b = d / "st3b"
+            drifted_rt = (now_utc + dt.timedelta(days=7, seconds=4)).strftime("%Y-%m-%dT%H:%M:%SZ")
+            drifted_u = make_usage(drifted_rt)
+            err3b = io.StringIO()
+            with mock.patch.dict(os.environ, {"AGY_QUOTA_WAKEUP_STATE_DIR": str(st3b)}):
+                with mock.patch.object(mod.time, "sleep"):
+                    with mock.patch.object(
+                        mod,
+                        "fetch_usage_with_retries",
+                        side_effect=[(zero_u, 1), (zero_u, 1), (zero_u, 1), (locked_u, 1), (drifted_u, 1)],
+                    ):
+                        with mock.patch.object(
+                            mod, "fetch_available_models", return_value=[("claude-sonnet-5-5-low", "Sonnet Low")]
+                        ):
+                            with mock.patch.object(mod, "send_wakeup_request", return_value=ok_probe):
+                                with redirect_stderr(err3b):
+                                    rc3b = mod.main(["run", "--pools", "3p", "--agy-bin", str(fake_agy)])
+            self.assertEqual(rc3b, 1)
+            rec3b = json.loads(err3b.getvalue().strip())
+            self.assertEqual(rec3b["status"], "partial_error")
+            self.assertFalse(rec3b["pools"]["3p"]["verified_active_after"])
+            saved3b = mod.load_json_dict(st3b / "state.json")
+            self.assertIs(saved3b["pools"]["3p"]["verified_active"], False)
+            self.assertIsNone(saved3b["pools"]["3p"]["locked_reset_time"])
+
+            # Case 4: +1s returns reset_time_expired_pending -> MUST NOT short-circuit -> runs +4s recheck -> still unverified
+            st4 = d / "st4"
+            expired_rt = (now_utc - dt.timedelta(seconds=5)).strftime("%Y-%m-%dT%H:%M:%SZ")
+            expired_u = make_usage(expired_rt)
+            err4 = io.StringIO()
+            with mock.patch.dict(os.environ, {"AGY_QUOTA_WAKEUP_STATE_DIR": str(st4)}):
+                with mock.patch.object(mod.time, "sleep"):
+                    with mock.patch.object(
+                        mod,
+                        "fetch_usage_with_retries",
+                        side_effect=[(zero_u, 1), (zero_u, 1), (expired_u, 1), (zero_u, 1)],
+                    ) as mock_fetch4:
+                        with mock.patch.object(
+                            mod, "fetch_available_models", return_value=[("claude-sonnet-5-5-low", "Sonnet Low")]
+                        ):
+                            with mock.patch.object(mod, "send_wakeup_request", return_value=ok_probe):
+                                with redirect_stderr(err4):
+                                    rc4 = mod.main(["run", "--pools", "3p", "--agy-bin", str(fake_agy)])
+            self.assertEqual(rc4, 1)
+            self.assertEqual(mock_fetch4.call_count, 4)
+            saved4 = mod.load_json_dict(st4 / "state.json")
+            self.assertIs(saved4["pools"]["3p"]["verified_active"], False)
+            self.assertIsNone(saved4["pools"]["3p"]["locked_reset_time"])
+
+            # Case 5: Cross-mode switches in 2.2s window (zero->drift & drift->zero) skip conservatively
+            st5 = d / "st5"
+            for first_u, second_u, expected_reason in (
+                (zero_u, locked_u, "reset_time_already_locked"),
+                (locked_u, zero_u, "reset_time_mode_changed"),
+            ):
+                out5 = io.StringIO()
+                with mock.patch.dict(os.environ, {"AGY_QUOTA_WAKEUP_STATE_DIR": str(st5)}):
+                    with mock.patch.object(mod.time, "sleep"):
+                        with mock.patch.object(
+                            mod, "fetch_usage_with_retries", side_effect=[(first_u, 1), (second_u, 1)]
+                        ):
+                            with mock.patch.object(mod, "send_wakeup_request") as mock_send5:
+                                with redirect_stdout(out5):
+                                    rc5 = mod.main(["run", "--pools", "3p", "--agy-bin", str(fake_agy)])
+                self.assertEqual(rc5, 0)
+                mock_send5.assert_not_called()
+                rec5 = json.loads(out5.getvalue().strip())
+                self.assertEqual(rec5["pools"]["3p"]["reason"], expected_reason)
+
+            # Case 6: Far-future drifting timestamp (> now + 7d + 600s) is rejected as reset_time_out_of_range
+            st6 = d / "st6"
+            far1 = make_usage("2099-01-01T00:00:00Z")
+            far2 = make_usage("2099-01-01T00:00:03Z")
+            out6 = io.StringIO()
+            with mock.patch.dict(os.environ, {"AGY_QUOTA_WAKEUP_STATE_DIR": str(st6)}):
+                with mock.patch.object(mod.time, "sleep"):
+                    with mock.patch.object(mod, "fetch_usage_with_retries", side_effect=[(far1, 1), (far2, 1)]):
+                        with mock.patch.object(mod, "send_wakeup_request") as mock_send6:
+                            with redirect_stdout(out6):
+                                rc6 = mod.main(["run", "--pools", "3p", "--agy-bin", str(fake_agy)])
+            self.assertEqual(rc6, 0)
+            mock_send6.assert_not_called()
+            rec6 = json.loads(out6.getvalue().strip())
+            self.assertEqual(rec6["pools"]["3p"]["reason"], "reset_time_out_of_range")
+
+    def test_format_record_line_and_status_probe_labels(self) -> None:
+        # 1) unactivated_zero_reset displays `unactivated` (both None and legacy 1970 string)
+        rec_new_zero = {
+            "ts": "2026-11-25T12:00:00+08:00",
+            "status": "dry_run",
+            "duration_ms": 50,
+            "pools": {
+                "3p": {
+                    "remaining_pct": 100.0,
+                    "reset_time": None,
+                    "reason": "unactivated_zero_reset",
+                    "action": "dry_run_would_wake",
+                }
+            },
+        }
+        self.assertIn("3p:dry_run_would_wake(100.0%@unactivated)", mod.format_record_line(rec_new_zero))
+
+        rec_legacy_zero = {
+            "ts": "2026-11-25T12:00:00+08:00",
+            "status": "ok",
+            "duration_ms": 50,
+            "pools": {
+                "3p": {
+                    "remaining_pct": 100.0,
+                    "reset_time": "1970-01-01T08:00:00+08:00",
+                    "reason": "unactivated_zero_reset",
+                    "action": "none",
+                }
+            },
+        }
+        self.assertIn("3p:100.0%@unactivated", mod.format_record_line(rec_legacy_zero))
+
+        # 2) exhausted_0pct / missing_reset_time / legacy non-zero reason with sentinel displays `-`
+        rec_exhausted_and_missing = {
+            "ts": "2026-11-25T12:00:00+08:00",
+            "status": "ok",
+            "duration_ms": 50,
+            "pools": {
+                "gemini": {
+                    "remaining_pct": 0.0,
+                    "reset_time": "1970-01-01T08:00:00+08:00",
+                    "reason": "exhausted_0pct",
+                    "action": "none",
+                },
+                "3p": {
+                    "remaining_pct": 100.0,
+                    "reset_time": "",
+                    "reason": "missing_reset_time",
+                    "action": "none",
+                },
+            },
+        }
+        line_em = mod.format_record_line(rec_exhausted_and_missing)
+        self.assertIn("gemini:0.0%@-", line_em)
+        self.assertIn("3p:100.0%@-", line_em)
+
+        # 3) Paired reset_time_after + reason_after reading on probed records
+        rec_probed_missing_after = {
+            "ts": "2026-11-25T12:00:00+08:00",
+            "status": "partial_error",
+            "duration_ms": 1200,
+            "pools": {
+                "3p": {
+                    "remaining_pct": 100.0,
+                    "reset_time": None,
+                    "reason": "unactivated_zero_reset",
+                    "action": "probed",
+                    "probe": {"model": "claude-sonnet-5-5-low", "mode": "chat_only"},
+                    "verified_active_after": False,
+                    "remaining_pct_after": 100.0,
+                    "reset_time_after": None,
+                    "reason_after": "missing_reset_time",
+                }
+            },
+        }
+        self.assertIn(
+            "3p:WAKE_SENT(claude-sonnet-5-5-low,verified=False)->100.0%@-",
+            mod.format_record_line(rec_probed_missing_after),
+        )
+
+        # 4) execute_status prints `Wakeup probes:` and `Last probe:`
+        with tempfile.TemporaryDirectory() as td:
+            st_dir = Path(td)
+            mod.append_jsonl_with_rotation(st_dir / "wakeup.jsonl", rec_probed_missing_after)
+            out_st = io.StringIO()
+            with mock.patch.dict(os.environ, {"AGY_QUOTA_WAKEUP_STATE_DIR": str(st_dir)}):
+                with mock.patch.object(mod.platform, "system", return_value="OtherOS"):
+                    with redirect_stdout(out_st):
+                        rc_st = mod.main(["status"])
+            self.assertEqual(rc_st, 0)
+            st_text = out_st.getvalue()
+            self.assertIn("Wakeup probes: 1", st_text)
+            self.assertIn("Last probe:", st_text)
+            self.assertNotIn("Last activation:", st_text)
+
+    def test_verified_true_with_none_locked_reset_triggers_unverified_cooldown(self) -> None:
+        t0 = dt.datetime(2026, 11, 25, 10, 0, 0, tzinfo=dt.timezone.utc)
+        dirty_none_state = {
+            "last_probe_epoch": t0.timestamp(),
+            "locked_reset_time": None,
+            "verified_active": True,
+        }
+        zero_bucket = {
+            "id": "3p-weekly",
+            "window": "weekly",
+            "remaining_fraction": 1.0,
+            "reset_time": "1970-01-01T00:00:00Z",
+        }
+        check_in = t0 + dt.timedelta(minutes=30)
+        drift_bucket = {
+            "id": "3p-weekly",
+            "window": "weekly",
+            "remaining_fraction": 1.0,
+            "reset_time": (check_in + dt.timedelta(days=7)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        }
+
+        for bucket in (zero_bucket, drift_bucket):
+            act_in, rsn_in, _ = mod.evaluate_bucket_activity(bucket, check_in, dirty_none_state)
+            self.assertTrue(act_in)
+            self.assertEqual(rsn_in, "unverified_probe_cooldown")
+
+        act_after, rsn_after, _ = mod.evaluate_bucket_activity(
+            zero_bucket, t0 + dt.timedelta(hours=2, seconds=1), dirty_none_state
+        )
+        self.assertFalse(act_after)
+        self.assertEqual(rsn_after, "unactivated_zero_reset")
+
+    def test_duplicate_weekly_buckets_for_same_pool_marked_error_and_skipped(self) -> None:
+        dup_usage = {
+            "status": "SUCCESS",
+            "command": {
+                "name": "usage",
+                "data": {
+                    "groups": [
+                        {
+                            "name": "Gemini Models",
+                            "buckets": [
+                                {
+                                    "id": "gemini-weekly",
+                                    "window": "weekly",
+                                    "remaining_fraction": 0.9,
+                                    "reset_time": "2026-12-01T00:00:00Z",
+                                }
+                            ],
+                        },
+                        {
+                            "name": "Claude and GPT models",
+                            "buckets": [
+                                {
+                                    "id": "3p-weekly",
+                                    "window": "weekly",
+                                    "remaining_fraction": 1.0,
+                                    "reset_time": "1970-01-01T00:00:00Z",
+                                },
+                                {
+                                    "id": "3p-weekly-alt",
+                                    "window": "weekly",
+                                    "remaining_fraction": 1.0,
+                                    "reset_time": "1970-01-01T00:00:00Z",
+                                },
+                            ],
+                        },
+                    ]
+                },
+            },
+        }
+        with tempfile.TemporaryDirectory() as td:
+            d = Path(td)
+            st_dir = d / "state"
+            fake_agy = d / "agy"
+            fake_agy.write_text("#!/bin/sh\necho '1.5.11'\n", encoding="utf-8")
+            fake_agy.chmod(0o755)
+            err_buf = io.StringIO()
+            with mock.patch.dict(os.environ, {"AGY_QUOTA_WAKEUP_STATE_DIR": str(st_dir)}):
+                with mock.patch.object(mod, "fetch_usage_with_retries", return_value=(dup_usage, 1)):
+                    with mock.patch.object(mod, "send_wakeup_request") as mock_send:
+                        with redirect_stderr(err_buf):
+                            rc = mod.main(["run", "--pools", "all", "--agy-bin", str(fake_agy)])
+            self.assertEqual(rc, 1)
+            mock_send.assert_not_called()
+            rec = json.loads(err_buf.getvalue().strip())
+            self.assertEqual(rec["status"], "error")
+            self.assertEqual(rec["pools"]["gemini"]["action"], "none")
+            self.assertEqual(rec["pools"]["3p"]["action"], "error")
+            self.assertIn("duplicate weekly buckets", rec["pools"]["3p"]["error"])
+
+    def test_pre_wakeup_bad_fraction_on_one_pool_does_not_block_healthy_pool(self) -> None:
+        now_utc = dt.datetime.now(dt.timezone.utc)
+        locked_rt = (now_utc + dt.timedelta(days=7)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+        def make_both_usage(g_rem: object, g_rt: str, p3_rem: object, p3_rt: str) -> dict:
+            return {
+                "status": "SUCCESS",
+                "command": {
+                    "name": "usage",
+                    "data": {
+                        "groups": [
+                            {
+                                "name": "Gemini Models",
+                                "buckets": [
+                                    {
+                                        "id": "gemini-weekly",
+                                        "window": "weekly",
+                                        "remaining_fraction": g_rem,
+                                        "reset_time": g_rt,
+                                    }
+                                ],
+                            },
+                            {
+                                "name": "Claude and GPT models",
+                                "buckets": [
+                                    {
+                                        "id": "3p-weekly",
+                                        "window": "weekly",
+                                        "remaining_fraction": p3_rem,
+                                        "reset_time": p3_rt,
+                                    }
+                                ],
+                            },
+                        ]
+                    },
+                },
+            }
+
+        first_u = make_both_usage(1.0, "1970-01-01T00:00:00Z", 1.0, "1970-01-01T00:00:00Z")
+        second_u = make_both_usage(1.5, "1970-01-01T00:00:00Z", 1.0, "1970-01-01T00:00:00Z")
+        after_u = make_both_usage(1.0, "1970-01-01T00:00:00Z", 1.0, locked_rt)
+        ok_probe = ({"status": "SUCCESS", "response": "OK", "usage": {"total_tokens": 500}}, "chat_only", None)
+
+        with tempfile.TemporaryDirectory() as td:
+            d = Path(td)
+            st_dir = d / "state"
+            fake_agy = d / "agy"
+            fake_agy.write_text("#!/bin/sh\necho '1.5.11'\n", encoding="utf-8")
+            fake_agy.chmod(0o755)
+            err_buf = io.StringIO()
+            with mock.patch.dict(os.environ, {"AGY_QUOTA_WAKEUP_STATE_DIR": str(st_dir)}):
+                with mock.patch.object(mod.time, "sleep"):
+                    with mock.patch.object(
+                        mod,
+                        "fetch_usage_with_retries",
+                        side_effect=[(first_u, 1), (second_u, 1), (after_u, 1), (after_u, 1)],
+                    ):
+                        with mock.patch.object(
+                            mod,
+                            "fetch_available_models",
+                            return_value=[
+                                ("gemini-3.8-flash-low", "Flash Low"),
+                                ("claude-sonnet-5-5-low", "Sonnet Low"),
+                            ],
+                        ):
+                            with mock.patch.object(mod, "send_wakeup_request", return_value=ok_probe) as mock_send:
+                                with redirect_stderr(err_buf):
+                                    rc = mod.main(["run", "--pools", "all", "--agy-bin", str(fake_agy)])
+            self.assertEqual(rc, 1)
+            self.assertEqual(mock_send.call_count, 1)
+            self.assertEqual(mock_send.call_args[0][1], "claude-sonnet-5-5-low")
+            rec = json.loads(err_buf.getvalue().strip())
+            self.assertEqual(rec["status"], "partial_error")
+            self.assertEqual(rec["pools"]["gemini"]["action"], "error")
+            self.assertIn("out-of-range", rec["pools"]["gemini"]["error"])
+            self.assertEqual(rec["pools"]["3p"]["action"], "probed")
+            self.assertTrue(rec["pools"]["3p"]["verified_active_after"])
 
 
 if __name__ == "__main__":

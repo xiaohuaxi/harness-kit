@@ -15,7 +15,7 @@ Segments (omitted automatically when absent):
 1. **cwd**: Current directory with optional longest-prefix alias rules (`AGY_STATUSLINE_PATH_ALIASES`) and `$HOME` → `~` shortening.
 2. **model**: Active model name with vendor prefix (`Claude ` / `Gemini ` / `GPT `) and trailing effort tag stripped.
 3. **effort**: Active reasoning effort (`low`, `medium`, `high`, `xhigh`, `max`).
-4. **context usage**: Used/total tokens (`k`/`M`), percentage, and `⛁ N` compact count when checkpoints exist.
+4. **context usage**: Used/total tokens (`k`/`M`), percentage, and `⛁ N` compact count when checkpoints exist. When `AGY_CLI_AUTO_COMPACT_OVERRIDE` is valid and smaller than the model's `context_window_size`, uses that threshold as the effective denominator and recomputes the percentage (when equal, keeps the payload percentage).
 5. **quota**: Independent Gemini (`G:`) weekly (`7d`) + 5-hour (`5h`) usage with reset countdown/clock, plus 3P/Claude (`C:`) weekly (`7d`) usage.
 6. **git branch**: Current branch or short detached commit hash when inside a git work tree (requires optional `git`).
 7. **cost**: Session total USD cost when provided in the status payload.
@@ -66,6 +66,7 @@ python3 tools/agy-statusline/test_agy_statusline.py -v
 | `AGY_STATUSLINE_STATE_DIR` | `$HOME/.gemini/antigravity-cli` | Base directory for transcript fallback reads, `quota-cache.json`, and default `quota-log.jsonl`. Supports leading `~/` expansion. |
 | `AGY_STATUSLINE_PATH_ALIASES` | *(empty)* | Colon-separated `prefix=alias` rules (e.g. `~/work/my-repo=~/MR:~/projects/app=~/APP`). Left-hand prefixes expand leading `~`/`~/` against `$HOME`, match longest prefix first, and strictly respect directory boundaries (`/foo/bar` never matches `/foo/bar2`). |
 | `AGY_STATUSLINE_QUOTA_LOG` | *(disabled)* | Opt-in quota change history log. Unset, empty, `0`, or `false` (case-insensitive) disables logging; `1` or `true` writes to `${AGY_STATUSLINE_STATE_DIR}/quota-log.jsonl`; any other non-empty value is treated as a custom file path (leading `~/` expanded, parent directories created automatically). Consecutive identical snapshots are deduplicated. |
+| `AGY_CLI_AUTO_COMPACT_OVERRIDE` | *(unset)* | Native `agy` auto-compaction threshold override (`350000`, `800K`, `0.5M`, or `80%`). Because `agy`'s statusLine payload currently reports only the full `context_window_size`, when this variable is valid and smaller than `context_window_size`, the status line uses it as the denominator and recalculates the context usage percentage against it; when equal, it keeps the payload percentage (invalid or out-of-range values fall back to `context_window_size`). |
 
 ## State & Cache Files
 
