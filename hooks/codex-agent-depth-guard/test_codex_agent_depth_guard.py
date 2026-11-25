@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""End-to-end unit tests for hooks/codex-depth-guard/multi-agent-depth-guard.py."""
+"""End-to-end unit tests for hooks/codex-agent-depth-guard/codex-agent-depth-guard.py."""
 
 from __future__ import annotations
 
@@ -14,7 +14,7 @@ from typing import Any
 
 sys.dont_write_bytecode = True
 
-SCRIPT_PATH = Path(__file__).resolve().parent / "multi-agent-depth-guard.py"
+SCRIPT_PATH = Path(__file__).resolve().parent / "codex-agent-depth-guard.py"
 MARKER = "CODEX MULTI-AGENT DEPTH GUARD: BLOCKED spawn_agent:"
 
 
@@ -52,7 +52,7 @@ class CodexDepthGuardTests(unittest.TestCase):
         direct_exec: bool = False,
     ) -> subprocess.CompletedProcess[str]:
         env = os.environ.copy()
-        env.pop("CODEX_MAX_CALLER_DEPTH", None)
+        env.pop("CODEX_MAX_AGENT_DEPTH", None)
         if env_overrides:
             for key, value in env_overrides.items():
                 if value is None:
@@ -120,9 +120,9 @@ class CodexDepthGuardTests(unittest.TestCase):
         self.assertEqual(proc_grandchild.returncode, 2)
         self.assertIn(MARKER, proc_grandchild.stderr)
         self.assertIn("caller depth 2", proc_grandchild.stderr)
-        self.assertIn("max caller depth 1", proc_grandchild.stderr)
         self.assertIn("depth 3", proc_grandchild.stderr)
-        self.assertIn("3 levels total", proc_grandchild.stderr)
+        self.assertIn("max agent depth 2", proc_grandchild.stderr)
+        self.assertIn("3 levels total: depth 0..2", proc_grandchild.stderr)
 
     def test_tool_name_and_hook_event_matching(self) -> None:
         child_t = self.make_subagent_transcript(1, "child.jsonl")
@@ -242,68 +242,104 @@ class CodexDepthGuardTests(unittest.TestCase):
         self.assertEqual(proc_missing_spawn.returncode, 2)
         self.assertIn("thread_spawn", proc_missing_spawn.stderr)
 
-    def test_max_caller_depth_env_var(self) -> None:
+    def test_max_agent_depth_env_var(self) -> None:
         root_t = self.make_root_transcript("env_root.jsonl")
         depth1_t = self.make_subagent_transcript(1, "env_d1.jsonl")
         depth2_t = self.make_subagent_transcript(2, "env_d2.jsonl")
         depth3_t = self.make_subagent_transcript(3, "env_d3.jsonl")
 
-        # CODEX_MAX_CALLER_DEPTH=0 -> only root (depth 0) may spawn; depth 1 is blocked
+        # CODEX_MAX_AGENT_DEPTH=0 -> root only (1 level total); even root is blocked
         proc_0_root = self.run_guard(
-            self.make_request(root_t), env_overrides={"CODEX_MAX_CALLER_DEPTH": "0"}
+            self.make_request(root_t), env_overrides={"CODEX_MAX_AGENT_DEPTH": "0"}
         )
-        self.assertEqual(proc_0_root.returncode, 0)
+        self.assertEqual(proc_0_root.returncode, 2)
+        self.assertIn("caller depth 0", proc_0_root.stderr)
+        self.assertIn("depth 1", proc_0_root.stderr)
+        self.assertIn("max agent depth 0", proc_0_root.stderr)
+        self.assertIn("1 level total: depth 0 only", proc_0_root.stderr)
 
         proc_0_d1 = self.run_guard(
             self.make_request(depth1_t, agent_id="a1"),
-            env_overrides={"CODEX_MAX_CALLER_DEPTH": "0"},
+            env_overrides={"CODEX_MAX_AGENT_DEPTH": "0"},
         )
         self.assertEqual(proc_0_d1.returncode, 2)
         self.assertIn("caller depth 1", proc_0_d1.stderr)
-        self.assertIn("max caller depth 0", proc_0_d1.stderr)
-        self.assertIn("2 levels total", proc_0_d1.stderr)
+        self.assertIn("max agent depth 0", proc_0_d1.stderr)
 
-        # CODEX_MAX_CALLER_DEPTH=2 -> depth 2 allowed, depth 3 blocked (4 levels total)
+        # CODEX_MAX_AGENT_DEPTH=1 -> root (depth 0) allowed, depth 1 blocked (2 levels total)
+        proc_1_root = self.run_guard(
+            self.make_request(root_t), env_overrides={"CODEX_MAX_AGENT_DEPTH": "1"}
+        )
+        self.assertEqual(proc_1_root.returncode, 0)
+
+        proc_1_d1 = self.run_guard(
+            self.make_request(depth1_t, agent_id="a1"),
+            env_overrides={"CODEX_MAX_AGENT_DEPTH": "1"},
+        )
+        self.assertEqual(proc_1_d1.returncode, 2)
+        self.assertIn("caller depth 1", proc_1_d1.stderr)
+        self.assertIn("depth 2", proc_1_d1.stderr)
+        self.assertIn("max agent depth 1", proc_1_d1.stderr)
+        self.assertIn("2 levels total: depth 0..1", proc_1_d1.stderr)
+
+        # CODEX_MAX_AGENT_DEPTH=2 -> depth 1 allowed, depth 2 blocked (3 levels total)
+        proc_2_d1 = self.run_guard(
+            self.make_request(depth1_t, agent_id="a1"),
+            env_overrides={"CODEX_MAX_AGENT_DEPTH": "2"},
+        )
+        self.assertEqual(proc_2_d1.returncode, 0)
+
         proc_2_d2 = self.run_guard(
             self.make_request(depth2_t, agent_id="a2"),
-            env_overrides={"CODEX_MAX_CALLER_DEPTH": "2"},
+            env_overrides={"CODEX_MAX_AGENT_DEPTH": "2"},
         )
-        self.assertEqual(proc_2_d2.returncode, 0)
+        self.assertEqual(proc_2_d2.returncode, 2)
+        self.assertIn("caller depth 2", proc_2_d2.stderr)
+        self.assertIn("depth 3", proc_2_d2.stderr)
+        self.assertIn("max agent depth 2", proc_2_d2.stderr)
+        self.assertIn("3 levels total: depth 0..2", proc_2_d2.stderr)
 
-        proc_2_d3 = self.run_guard(
+        # CODEX_MAX_AGENT_DEPTH=3 -> depth 2 allowed, depth 3 blocked (4 levels total)
+        proc_3_d2 = self.run_guard(
+            self.make_request(depth2_t, agent_id="a2"),
+            env_overrides={"CODEX_MAX_AGENT_DEPTH": "3"},
+        )
+        self.assertEqual(proc_3_d2.returncode, 0)
+
+        proc_3_d3 = self.run_guard(
             self.make_request(depth3_t, agent_id="a3"),
-            env_overrides={"CODEX_MAX_CALLER_DEPTH": "2"},
+            env_overrides={"CODEX_MAX_AGENT_DEPTH": "3"},
         )
-        self.assertEqual(proc_2_d3.returncode, 2)
-        self.assertIn("caller depth 3", proc_2_d3.stderr)
-        self.assertIn("max caller depth 2", proc_2_d3.stderr)
-        self.assertIn("depth 4", proc_2_d3.stderr)
-        self.assertIn("4 levels total", proc_2_d3.stderr)
+        self.assertEqual(proc_3_d3.returncode, 2)
+        self.assertIn("caller depth 3", proc_3_d3.stderr)
+        self.assertIn("depth 4", proc_3_d3.stderr)
+        self.assertIn("max agent depth 3", proc_3_d3.stderr)
+        self.assertIn("4 levels total: depth 0..3", proc_3_d3.stderr)
 
-        # Empty string falls back to default 1
+        # Empty string falls back to default 2
         proc_empty_d1 = self.run_guard(
             self.make_request(depth1_t, agent_id="a1"),
-            env_overrides={"CODEX_MAX_CALLER_DEPTH": ""},
+            env_overrides={"CODEX_MAX_AGENT_DEPTH": ""},
         )
         self.assertEqual(proc_empty_d1.returncode, 0)
 
         proc_empty_d2 = self.run_guard(
             self.make_request(depth2_t, agent_id="a2"),
-            env_overrides={"CODEX_MAX_CALLER_DEPTH": ""},
+            env_overrides={"CODEX_MAX_AGENT_DEPTH": ""},
         )
         self.assertEqual(proc_empty_d2.returncode, 2)
-        self.assertIn("max caller depth 1", proc_empty_d2.stderr)
+        self.assertIn("max agent depth 2", proc_empty_d2.stderr)
 
         # Invalid values strictly fail closed
         for bad_env in ("-1", "abc", "1.5", " 1", "1 ", "+1", "²"):
             with self.subTest(bad_env=bad_env):
                 proc_bad = self.run_guard(
                     self.make_request(root_t),
-                    env_overrides={"CODEX_MAX_CALLER_DEPTH": bad_env},
+                    env_overrides={"CODEX_MAX_AGENT_DEPTH": bad_env},
                 )
                 self.assertEqual(proc_bad.returncode, 2)
                 self.assertIn(MARKER, proc_bad.stderr)
-                self.assertIn("CODEX_MAX_CALLER_DEPTH", proc_bad.stderr)
+                self.assertIn("CODEX_MAX_AGENT_DEPTH", proc_bad.stderr)
 
 
 if __name__ == "__main__":

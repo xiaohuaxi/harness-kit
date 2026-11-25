@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Block Codex subagent spawning beyond the configured caller depth limit."""
+"""Block Codex subagent spawning beyond the configured max agent depth."""
 
 from __future__ import annotations
 
@@ -11,8 +11,8 @@ from typing import Any
 
 
 MARKER = "CODEX MULTI-AGENT DEPTH GUARD"
-ENV_MAX_CALLER_DEPTH = "CODEX_MAX_CALLER_DEPTH"
-DEFAULT_MAX_CALLER_DEPTH = 1
+ENV_MAX_AGENT_DEPTH = "CODEX_MAX_AGENT_DEPTH"
+DEFAULT_MAX_AGENT_DEPTH = 2
 
 
 def reject(reason: str) -> int:
@@ -20,13 +20,13 @@ def reject(reason: str) -> int:
     return 2
 
 
-def resolve_max_caller_depth() -> int:
-    raw = os.environ.get(ENV_MAX_CALLER_DEPTH)
+def resolve_max_agent_depth() -> int:
+    raw = os.environ.get(ENV_MAX_AGENT_DEPTH)
     if raw is None or raw == "":
-        return DEFAULT_MAX_CALLER_DEPTH
+        return DEFAULT_MAX_AGENT_DEPTH
     if not (raw.isascii() and raw.isdigit()):
         raise ValueError(
-            f"invalid {ENV_MAX_CALLER_DEPTH}={raw!r}: "
+            f"invalid {ENV_MAX_AGENT_DEPTH}={raw!r}: "
             "must be a non-negative base-10 integer"
         )
     return int(raw)
@@ -77,7 +77,7 @@ def caller_depth(request: dict[str, Any]) -> int:
 
 def main() -> int:
     try:
-        max_caller_depth = resolve_max_caller_depth()
+        max_agent_depth = resolve_max_agent_depth()
     except ValueError as error:
         return reject(str(error))
 
@@ -90,13 +90,16 @@ def main() -> int:
         return reject("unexpected tool name")
 
     depth = caller_depth(request)
-    if depth > max_caller_depth:
-        max_agent_depth = max_caller_depth + 1
-        max_levels = max_caller_depth + 2
+    next_depth = depth + 1
+    if next_depth > max_agent_depth:
+        total_levels = max_agent_depth + 1
+        if max_agent_depth == 0:
+            range_desc = "1 level total: depth 0 only"
+        else:
+            range_desc = f"{total_levels} levels total: depth 0..{max_agent_depth}"
         return reject(
-            f"caller depth {depth} exceeds max caller depth {max_caller_depth} "
-            f"and may not create depth {depth + 1} "
-            f"(maximum allowed tree depth is {max_agent_depth}, {max_levels} levels total)"
+            f"caller depth {depth} may not create depth {next_depth} "
+            f"(exceeds max agent depth {max_agent_depth}; {range_desc})"
         )
     return 0
 

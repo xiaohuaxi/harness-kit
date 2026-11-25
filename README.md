@@ -18,7 +18,8 @@ Standalone CLI tools, skills, hooks, agent-executable guides, and reusable build
 | **Tools** | `agy-statusline` | Soft 256-color, 7-segment `statusLine` command for Antigravity CLI (`agy`) with transcript `CHECKPOINT` fallback and atomic quota cache persistence. | [`tools/agy-statusline/README.md`](tools/agy-statusline/README.md) |
 | **Tools** | `claude-statusline` | Soft 256-color, 7-segment `statusLine` command for Claude Code with graceful API-key / third-party fallback and opt-in quota history logging. | [`tools/claude-statusline/README.md`](tools/claude-statusline/README.md) |
 | **Tools** | `codex-quota-wakeup` | Zero-token polling & isolated minimal read-only weekly quota wakeup daemon (`launchd` / `systemd --user`) for Codex CLI ChatGPT subscriptions. | [`tools/codex-quota-wakeup/README.md`](tools/codex-quota-wakeup/README.md) |
-| **Hooks** | `codex-depth-guard` | Fail-closed `PreToolUse` recursion depth guard hook for Codex CLI multi-agent (`multi_agent_v2`), capping `spawn_agent` nesting depth with authoritative transcript checks. | [`hooks/codex-depth-guard/README.md`](hooks/codex-depth-guard/README.md) |
+| **Hooks** | `agy-agent-depth-guard` | Fail-closed `PreToolUse` recursion depth guard hook for Antigravity CLI (`agy`) subagent delegation, capping `invoke_subagent` nesting depth via ancestry tracing. | [`hooks/agy-agent-depth-guard/README.md`](hooks/agy-agent-depth-guard/README.md) |
+| **Hooks** | `codex-agent-depth-guard` | Fail-closed `PreToolUse` recursion depth guard hook for Codex CLI multi-agent (`multi_agent_v2`), capping `spawn_agent` nesting depth with authoritative transcript checks. | [`hooks/codex-agent-depth-guard/README.md`](hooks/codex-agent-depth-guard/README.md) |
 | **Skills** | `agy-run` | Cross-agent skill and pure-stdlib Python runner for bounded Antigravity (`agy acp`) tasks with `--resume`, live `--steer`, three-tier sandbox checks, and `--list-models`. | [`skills/agy-run/README.md`](skills/agy-run/README.md) |
 | **Skills** | `codex-run` | Cross-agent skill and pure-stdlib Python runner for bounded `codex app-server` tasks with `--resume`, live `--steer`, anti-early-exit subagent draining, external profiles, and `--list-models`. | [`skills/codex-run/README.md`](skills/codex-run/README.md) |
 | **Guides** | `google-ai-perks` | Agent-executable guide to inspect, claim, configure, and verify Google AI Pro / Ultra subscription perks (Cloud credits, Colab GPU CU, Flow, Drive, YouTube, etc.). | [`guides/google-ai-perks/README.md`](guides/google-ai-perks/README.md) |
@@ -102,15 +103,45 @@ chmod +x "$CLAUDE_DIR/claude-statusline"
 
 Path aliases (`CLAUDE_STATUSLINE_PATH_ALIASES`), opt-in quota history logging (`CLAUDE_STATUSLINE_QUOTA_LOG`), and state directory details (`CLAUDE_STATUSLINE_STATE_DIR`) are documented in [`tools/claude-statusline/README.md`](tools/claude-statusline/README.md).
 
-### 4. Codex Multi-Agent Depth Guard Hook (`hooks/codex-depth-guard`)
+### 4. Antigravity Subagent Depth Guard Hook (`hooks/agy-agent-depth-guard`)
+
+Copy the hook script (requires Python 3.8+ and Antigravity CLI `agy` with `PreToolUse` hook support) and register it in `~/.gemini/config/hooks.json`:
+
+```bash
+mkdir -p ~/.gemini/config/hooks
+cp hooks/agy-agent-depth-guard/agy-agent-depth-guard.py ~/.gemini/config/hooks/agy-agent-depth-guard.py
+chmod +x ~/.gemini/config/hooks/agy-agent-depth-guard.py
+```
+
+```json
+{
+  "agy-agent-depth-guard": {
+    "PreToolUse": [
+      {
+        "matcher": "invoke_subagent",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 ~/.gemini/config/hooks/agy-agent-depth-guard.py"
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+Depth hierarchy (`AGY_MAX_AGENT_DEPTH`, default `2` for 3 levels total) and fail-closed boundary details are documented in [`hooks/agy-agent-depth-guard/README.md`](hooks/agy-agent-depth-guard/README.md).
+
+### 5. Codex Multi-Agent Depth Guard Hook (`hooks/codex-agent-depth-guard`)
 
 Copy the hook script (requires Python 3.8+ and a Codex CLI release supporting `PreToolUse` hooks) and wire it into `${CODEX_HOME:-$HOME/.codex}/config.toml` (default: `~/.codex/config.toml`):
 
 ```bash
 CODEX_DIR="${CODEX_HOME:-$HOME/.codex}"
 mkdir -p "$CODEX_DIR/hooks"
-cp hooks/codex-depth-guard/multi-agent-depth-guard.py "$CODEX_DIR/hooks/multi-agent-depth-guard.py"
-chmod +x "$CODEX_DIR/hooks/multi-agent-depth-guard.py"
+cp hooks/codex-agent-depth-guard/codex-agent-depth-guard.py "$CODEX_DIR/hooks/codex-agent-depth-guard.py"
+chmod +x "$CODEX_DIR/hooks/codex-agent-depth-guard.py"
 ```
 
 ```toml
@@ -123,13 +154,13 @@ matcher = "spawn_agent$"
 
 [[hooks.PreToolUse.hooks]]
 type = "command"
-command = '"${CODEX_HOME:-$HOME/.codex}/hooks/multi-agent-depth-guard.py"'
+command = '"${CODEX_HOME:-$HOME/.codex}/hooks/codex-agent-depth-guard.py"'
 timeout = 10
 ```
 
-Depth hierarchy (`CODEX_MAX_CALLER_DEPTH`, default `1` for 3 levels total) and fail-closed boundary details are documented in [`hooks/codex-depth-guard/README.md`](hooks/codex-depth-guard/README.md).
+Depth hierarchy (`CODEX_MAX_AGENT_DEPTH`, default `2` for 3 levels total) and fail-closed boundary details are documented in [`hooks/codex-agent-depth-guard/README.md`](hooks/codex-agent-depth-guard/README.md).
 
-### 5. Cross-Agent Runner Skills (`skills/agy-run`, `skills/codex-run`)
+### 6. Cross-Agent Runner Skills (`skills/agy-run`, `skills/codex-run`)
 
 Both skills require a POSIX host (macOS, Linux, or WSL2), Python 3.8+, and the corresponding local CLI (`agy` / `codex`). Copy or symlink each skill directory into your host agent's skill directory:
 
@@ -157,7 +188,7 @@ Full flags (`--write`, `--yolo`, `--resume`, `--steer`, `--profile`), sandbox sc
 - [`skills/agy-run/README.md`](skills/agy-run/README.md)
 - [`skills/codex-run/README.md`](skills/codex-run/README.md)
 
-### 6. Agent Guides (`guides/google-ai-perks`)
+### 7. Agent Guides (`guides/google-ai-perks`)
 
 Point your AI agent (Antigravity / Claude Code / Codex) to [`guides/google-ai-perks/google-ai-perks-agent-guide.md`](guides/google-ai-perks/google-ai-perks-agent-guide.md) and ask it to inspect, claim, configure, and verify your Google AI subscription perks. See [`guides/google-ai-perks/README.md`](guides/google-ai-perks/README.md) for details.
 
@@ -172,7 +203,8 @@ python3 tools/agy-quota-wakeup/test_agy_quota_wakeup.py -v
 python3 tools/agy-statusline/test_agy_statusline.py -v
 python3 tools/claude-statusline/test_claude_statusline.py -v
 python3 tools/codex-quota-wakeup/test_codex_quota_wakeup.py -v
-python3 hooks/codex-depth-guard/test_codex_depth_guard.py -v
+python3 hooks/agy-agent-depth-guard/test_agy_agent_depth_guard.py -v
+python3 hooks/codex-agent-depth-guard/test_codex_agent_depth_guard.py -v
 python3 skills/agy-run/tests/test_agy_run.py -v
 python3 skills/codex-run/tests/test_codex_run.py -v
 ```

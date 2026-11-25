@@ -1,6 +1,6 @@
 **English** | [简体中文](README.zh-CN.md)
 
-# codex-depth-guard
+# codex-agent-depth-guard
 
 Fail-closed `PreToolUse` depth guard hook for **Codex CLI** multi-agent (`multi_agent_v2`). Single-file script, Python 3.8+ standard library only, zero external dependencies.
 
@@ -11,27 +11,28 @@ Fail-closed `PreToolUse` depth guard hook for **Codex CLI** multi-agent (`multi_
 
 ## Depth Hierarchy
 
-`CODEX_MAX_CALLER_DEPTH` limits the deepest **caller** allowed to invoke `spawn_agent`. Because a caller at depth `N` spawns a child at depth `N + 1`, setting `CODEX_MAX_CALLER_DEPTH=1` (the default) caps the tree at **3 levels total** (`depth 0` → `depth 1` → `depth 2`):
+`CODEX_MAX_AGENT_DEPTH` sets the 0-based **maximum agent depth** allowed in the delegation tree (the root session is `depth 0`, children are `depth 1`, grandchildren are `depth 2`, and so on). A `spawn_agent` call is blocked whenever `caller_depth + 1 > CODEX_MAX_AGENT_DEPTH`. Setting `CODEX_MAX_AGENT_DEPTH=2` (the default) caps the tree at **3 levels total** (`depth 0` → `depth 1` → `depth 2`):
 
 ```text
-depth 0  (root session)      ──▶ spawn_agent ALLOWED (creates depth 1)
-  └─ depth 1  (child)        ──▶ spawn_agent ALLOWED (depth 1 <= MAX_CALLER_DEPTH=1; creates depth 2)
-       └─ depth 2  (grandchild) ──▶ spawn_agent BLOCKED (depth 2 > 1; may not create depth 3)
+depth 0  (root session)      ──▶ spawn_agent ALLOWED (creates depth 1 <= MAX_AGENT_DEPTH=2)
+  └─ depth 1  (child)        ──▶ spawn_agent ALLOWED (creates depth 2 <= MAX_AGENT_DEPTH=2)
+       └─ depth 2  (grandchild) ──▶ spawn_agent BLOCKED (may not create depth 3 > 2)
 ```
 
-In general, `CODEX_MAX_CALLER_DEPTH = N` allows agent depths `0 .. N + 1` (`N + 2` levels total):
-- `0` → 2 levels (`root` → `child`; children cannot spawn)
-- `1` (default) → 3 levels (`root` → `child` → `grandchild`; grandchildren cannot spawn)
-- `2` → 4 levels (`depth 0` → `1` → `2` → `3`; depth 3 cannot spawn)
+In general, `CODEX_MAX_AGENT_DEPTH = N` allows agent depths `0 .. N` (`N + 1` levels total):
+- `0` → 1 level (`depth 0` root only; all subagent delegation blocked)
+- `1` → 2 levels (`depth 0` → `1`: `root` → `child`; children cannot spawn)
+- `2` (default) → 3 levels (`depth 0` → `1` → `2`: `root` → `child` → `grandchild`; grandchildren cannot spawn)
+- `3` → 4 levels (`depth 0` → `1` → `2` → `3`: `root` → `child` → `grandchild` → `great-grandchild`; depth 3 cannot spawn)
 
 ## How It Works
 
-1. **Configuration & Protocol Checks**: Parses `CODEX_MAX_CALLER_DEPTH` (strictly non-negative base-10 integer, or empty/unset for default `1`), parses JSON from `stdin`, and verifies `hook_event_name == "PreToolUse"` and `tool_name.endswith("spawn_agent")` (covering both plain `spawn_agent` and flattened v2 names such as `multi_agent_v2.spawn_agent`).
+1. **Configuration & Protocol Checks**: Parses `CODEX_MAX_AGENT_DEPTH` (strictly non-negative ASCII base-10 integer, or empty/unset for default `2`), parses JSON from `stdin`, and verifies `hook_event_name == "PreToolUse"` and `tool_name.endswith("spawn_agent")` (covering both plain `spawn_agent` and flattened v2 names such as `multi_agent_v2.spawn_agent`).
 2. **Authoritative Depth Lookup**: Reads the first JSONL line of `transcript_path` and checks its `session_meta` payload:
    - **Root session** (`source` is a non-empty string such as `"cli"`, `"exec"`, or `"vscode"`): treated as `depth = 0`, and cross-checked so neither `agent_id` nor `agent_type` is present in the hook payload.
    - **Subagent session** (`source.subagent.thread_spawn.depth`): validates `depth` is a positive integer (rejecting booleans, zero, negatives, floats, and strings) and requires `agent_id` in the hook payload.
    - **Missing or unrecognized `source`**: rejected immediately (fail-closed) rather than assumed to be a root session.
-3. **Fail-Closed Enforcement**: If `depth > max_caller_depth`—or if any check or I/O operation fails—the script writes `CODEX MULTI-AGENT DEPTH GUARD: BLOCKED spawn_agent: ...` to `stderr` and terminates immediately with `os._exit(2)`.
+3. **Fail-Closed Enforcement**: If `depth + 1 > max_agent_depth`—or if any check or I/O operation fails—the script writes `CODEX MULTI-AGENT DEPTH GUARD: BLOCKED spawn_agent: ...` to `stderr` and terminates immediately with `os._exit(2)`.
 
 ## Quick Install
 
@@ -42,8 +43,8 @@ Requirements: Python 3.8+ (standard library only) and a Codex CLI release suppor
 ```bash
 CODEX_DIR="${CODEX_HOME:-$HOME/.codex}"
 mkdir -p "$CODEX_DIR/hooks"
-cp hooks/codex-depth-guard/multi-agent-depth-guard.py "$CODEX_DIR/hooks/multi-agent-depth-guard.py"
-chmod +x "$CODEX_DIR/hooks/multi-agent-depth-guard.py"
+cp hooks/codex-agent-depth-guard/codex-agent-depth-guard.py "$CODEX_DIR/hooks/codex-agent-depth-guard.py"
+chmod +x "$CODEX_DIR/hooks/codex-agent-depth-guard.py"
 ```
 
 2. Add the hook configuration to `${CODEX_HOME:-$HOME/.codex}/config.toml` (default: `~/.codex/config.toml`):
@@ -60,25 +61,25 @@ matcher = "spawn_agent$"
 
 [[hooks.PreToolUse.hooks]]
 type = "command"
-command = '"${CODEX_HOME:-$HOME/.codex}/hooks/multi-agent-depth-guard.py"'
+command = '"${CODEX_HOME:-$HOME/.codex}/hooks/codex-agent-depth-guard.py"'
 timeout = 10
 ```
 
 > - Keep `enable_fanout = false` under `[features]` so CSV fanout cannot bypass the `spawn_agent` hook path.
 > - To customize the limit per config without exporting a global shell variable, prefix the command:
->   `command = 'CODEX_MAX_CALLER_DEPTH=2 "${CODEX_HOME:-$HOME/.codex}/hooks/multi-agent-depth-guard.py"'`
+>   `command = 'CODEX_MAX_AGENT_DEPTH=3 "${CODEX_HOME:-$HOME/.codex}/hooks/codex-agent-depth-guard.py"'`
 
 ## Environment Variables
 
 | Variable | Default | Description |
 | --- | --- | --- |
-| `CODEX_MAX_CALLER_DEPTH` | `1` | Maximum caller depth allowed to invoke `spawn_agent`. Unset or empty string falls back to `1` (3 levels total). Must be a non-negative base-10 ASCII integer (`0`, `1`, `2`, ...); any invalid value (such as `-1`, `abc`, `1.5`, or whitespace) fails closed with exit code `2`. |
+| `CODEX_MAX_AGENT_DEPTH` | `2` | 0-based maximum agent depth allowed in the delegation tree (`0 .. N`, `N + 1` levels total). Unset or empty string falls back to `2` (3 levels total: `depth 0..2`). `0` disables all subagent delegation (root only). Must be a non-negative ASCII base-10 integer (`0`, `1`, `2`, ...); any invalid value (such as `-1`, `abc`, `1.5`, or whitespace) fails closed with exit code `2`. |
 
 ## Fail-Closed Boundaries
 
 Any of the following conditions immediately denies `spawn_agent` (exit code `2` + diagnostic on `stderr`):
 
-- Invalid `CODEX_MAX_CALLER_DEPTH` value (negative, non-integer, float, whitespace, non-ASCII digits)
+- Invalid `CODEX_MAX_AGENT_DEPTH` value (negative, non-integer, float, whitespace, non-ASCII digits)
 - Malformed JSON, empty `stdin`, or non-object JSON payload
 - `hook_event_name` is not `"PreToolUse"`, or `tool_name` does not end with `"spawn_agent"`
 - Missing, empty, non-string, or unreadable `transcript_path`
@@ -91,5 +92,5 @@ Any of the following conditions immediately denies `spawn_agent` (exit code `2` 
 ## Running Tests
 
 ```bash
-python3 hooks/codex-depth-guard/test_codex_depth_guard.py -v
+python3 hooks/codex-agent-depth-guard/test_codex_agent_depth_guard.py -v
 ```
